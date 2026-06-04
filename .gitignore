@@ -14,4 +14,5 @@ venv/
 node_modules/
 logs/
 .pytest_cache/
+data/
 .*/
