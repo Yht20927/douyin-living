@@ -1,0 +1,12 @@
+# Core dependencies (required for recording + clipping baseline)
+aiohttp>=3.9
+httpx>=0.27
+protobuf>=5.0
+websockets>=12.0
+websocket-client>=1.6
+PyExecJS>=1.5
+python-dotenv>=1.0
+loguru>=0.7
+openpyxl>=3.1
+scipy>=1.10
+numpy>=1.23
