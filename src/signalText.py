@@ -123,7 +123,9 @@ def extractFeatures(
             dmSentimentSum[sec] += sentiment
             dmSentimentCount[sec] += 1
         except Exception:
-            pass
+            # One bad message must not derail the whole stream — log at debug
+            # so the volume stays manageable but errors are still inspectable.
+            log.debug("Sentiment failed for one message", exc_info=True)
 
     # ── Deduplicate users (privacy) ─────────────────────────────
     uniqueUserCounts = [len(s) for s in dmUniqueUsers]
@@ -141,8 +143,36 @@ def extractFeatures(
     # ── Process ASR ────────────────────────────────────────────
     log.debug("Processing ASR segments...")
 
-    # Lazy-load FastText
+    # Lazy-load FastText + pre-compute keyword vectors ONCE.
+    # Without caching this is O(segments × keywords) get_sentence_vector
+    # calls, which dominates the text pipeline on long recordings.
     _fastTextModel = None
+    _kwVectors: list[np.ndarray] | None = None
+    _kwNorms: np.ndarray | None = None
+
+    def _ensureFastText():
+        nonlocal _fastTextModel, _kwVectors, _kwNorms
+        if _fastTextModel is not None or _kwVectors is not None:
+            return
+        try:
+            import fasttext
+        except ImportError:
+            log.warning("fasttext not installed — falling back to exact keyword match")
+            _fastTextModel = False  # mark as tried + failed (truthy check below)
+            return
+        modelPath = Path("cc.zh.100.bin")
+        if not modelPath.exists():
+            log.warning("FastText model cc.zh.100.bin not found — falling back to exact match")
+            _fastTextModel = False
+            return
+        _fastTextModel = fasttext.load_model(str(modelPath))
+        # Pre-embed every keyword once (kept as float32 vectors)
+        vecs = [_fastTextModel.get_sentence_vector(kw) for kw in keywords]
+        _kwVectors = [v.astype(np.float32) for v in vecs]
+        _kwNorms = np.array(
+            [np.linalg.norm(v) + 1e-10 for v in _kwVectors], dtype=np.float32
+        )
+        log.debug(f"FastText loaded; pre-embedded {len(_kwVectors)} keywords")
 
     for seg in asrSegments:
         text = seg.get("text", "")
@@ -154,29 +184,22 @@ def extractFeatures(
         if endSec >= nSecs:
             endSec = nSecs - 1
 
-        # Keyword matching
+        # Keyword matching — compute ONCE per segment, fan out to seconds
         try:
-            # Lazy-load FastText
-            if _fastTextModel is None:
-                import fasttext
-                _fastTextModel = fasttext.load_model("cc.zh.100.bin") if Path("cc.zh.100.bin").exists() else None
-                if _fastTextModel is None:
-                    log.warning("FastText model not found — falling back to exact keyword match")
+            _ensureFastText()
 
             if _fastTextModel:
-                # Fuzzy matching via FastText
-                for sec in range(startSec, endSec):
-                    if _fuzzyMatch(text, keywords, _fastTextModel):
-                        asrKeyword[sec] = 1
+                # Fuzzy matching via FastText — uses pre-embedded keyword vectors
+                hit = _fuzzyMatchCached(text, keywords, _fastTextModel, _kwVectors, _kwNorms)
             else:
                 # Exact keyword match
+                hit = any(kw in text for kw in keywords)
+
+            if hit:
                 for sec in range(startSec, endSec):
-                    for kw in keywords:
-                        if kw in text:
-                            asrKeyword[sec] = 1
-                            break
+                    asrKeyword[sec] = 1
         except Exception:
-            pass
+            log.debug("Keyword matching failed for segment", exc_info=True)
 
         # Speaker change
         speaker = seg.get("speaker", "")
@@ -270,6 +293,7 @@ def _fastSentiment(words: list[str]) -> float:
             )
             _sentimentAvailable = True
         except Exception:
+            log.debug("HF sentiment pipeline unavailable — using rule fallback", exc_info=True)
             _sentimentAvailable = False  # Mark as tried (even if failed)
 
     if _sentimentAvailable and _sentimentPipeline:
@@ -278,7 +302,9 @@ def _fastSentiment(words: list[str]) -> float:
             score = result["score"]
             return score if result["label"].upper() == "POSITIVE" else -score
         except Exception:
-            pass
+            # Per-call failure → quietly degrade to rules; the pipeline itself
+            # is still considered available so we keep trying subsequent texts.
+            log.debug("HF sentiment inference failed for one text", exc_info=True)
 
     # Fallback: rule-based
     positive = {"哈哈", "好", "nice", "牛", "赞", "喜欢", "漂亮", "精彩", "笑", "乐"}
@@ -352,7 +378,12 @@ def _secondDerivative(arr: list[float]) -> list[float]:
 
 
 def _fuzzyMatch(text: str, keywords: list[str], model) -> bool:
-    """FastText fuzzy keyword matching with cosine similarity."""
+    """FastText fuzzy keyword matching (un-cached fallback path).
+
+    Prefer ``_fuzzyMatchCached`` when scanning many segments — this version
+    re-embeds every keyword on each call and is only kept for callers that
+    don't pre-compute keyword vectors.
+    """
     # Exact match first (fast path)
     for kw in keywords:
         if kw in text:
@@ -361,14 +392,45 @@ def _fuzzyMatch(text: str, keywords: list[str], model) -> bool:
     if model is not None:
         try:
             textVec = model.get_sentence_vector(text)
+            textNorm = np.linalg.norm(textVec) + 1e-10
             for kw in keywords:
                 kwVec = model.get_sentence_vector(kw)
-                sim = float(np.dot(textVec, kwVec) / (np.linalg.norm(textVec) * np.linalg.norm(kwVec) + 1e-10))
-                if sim > 0.7:
+                sim = float(np.dot(textVec, kwVec) / (textNorm * (np.linalg.norm(kwVec) + 1e-10)))
+                if sim > SIMILARITY_THRESHOLD:
                     return True
         except Exception:
             pass
     return False
+
+
+def _fuzzyMatchCached(
+    text: str,
+    keywords: list[str],
+    model,
+    kwVectors: list[np.ndarray] | None,
+    kwNorms: np.ndarray | None,
+) -> bool:
+    """FastText fuzzy match using pre-embedded keyword vectors.
+
+    Computes the text vector once, then dot-products it against the
+    cached keyword matrix in a single vectorised step.  Drops the cost
+    from O(segments × keywords) embeddings to O(segments) embeddings.
+    """
+    # Exact match first (fast path) — same as before, no embedding cost
+    for kw in keywords:
+        if kw in text:
+            return True
+    if model is None or kwVectors is None or kwNorms is None:
+        return False
+    try:
+        textVec = model.get_sentence_vector(text).astype(np.float32)
+        textNorm = float(np.linalg.norm(textVec)) + 1e-10
+        # Stack once per call; cheap relative to embedding the text
+        kwMatrix = np.stack(kwVectors)            # (K, D)
+        sims = (kwMatrix @ textVec) / (kwNorms * textNorm)
+        return bool(np.any(sims > SIMILARITY_THRESHOLD))
+    except Exception:
+        return False
 
 
 def _computeEntropyWindow(allText30s: list[list[str]], nSecs: int) -> list[float]:

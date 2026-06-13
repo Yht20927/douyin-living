@@ -207,15 +207,22 @@ class Controller:
         await self._stopEvent.wait()
         await self.stop()
 
-        # Extract audio from the last downloaded FLV segment
-        if self._flvRecorder and self._flvRecorder._downloadedFiles:
-            lastFlv = self._flvRecorder._downloadedFiles[-1]
-            self._flvPath = lastFlv
-            audioPath = lastFlv.rsplit(".", 1)[0] + ".aac"
-            await self._extractAudio(lastFlv, audioPath)
-        elif self._flvRecorder and self._flvRecorder._currentFile:
-            # Rotation hasn't happened yet — use current file
-            self._flvPath = self._flvRecorder._currentFile
+        # Collect every FLV segment that was rotated out, plus the in-progress one.
+        # Multi-segment recordings (>30min) MUST all be processed — we merge
+        # them losslessly into a single MP4 so the downstream pipeline sees one
+        # continuous timeline.
+        segments: list[str] = []
+        if self._flvRecorder:
+            segments.extend(self._flvRecorder._downloadedFiles or [])
+            current = self._flvRecorder._currentFile
+            if current and current not in segments and os.path.exists(current):
+                segments.append(current)
+
+        merged = await self._mergeFlvSegments(segments)
+        if merged:
+            self._flvPath = merged
+            audioPath = merged.rsplit(".", 1)[0] + ".aac"
+            await self._extractAudio(merged, audioPath)
 
     # ── Clipping pipeline ──────────────────────────────────────
 
@@ -230,13 +237,27 @@ class Controller:
         log.info("Starting AI clipping pipeline")
         log.info("=" * 50)
 
-        # Find the latest FLV file
-        flvFiles = sorted(Path(self.outputDir).glob("*.flv"))
-        if not flvFiles:
-            log.error(f"No FLV files in {self.outputDir}")
-            return
-
-        videoPath = str(flvFiles[-1])
+        # Resolve the source video. Prefer a previously merged file
+        # (data/{roomId}/{roomId}_merged.mp4); otherwise auto-merge any FLV
+        # segments we find on disk so multi-segment recordings work end-to-end.
+        mergedPath = os.path.join(self.outputDir, f"{self.webRid}_merged.mp4")
+        if os.path.exists(mergedPath):
+            videoPath = mergedPath
+        else:
+            flvFiles = sorted(Path(self.outputDir).glob("*.flv"))
+            if not flvFiles:
+                log.error(f"No FLV files in {self.outputDir}")
+                return
+            if len(flvFiles) == 1:
+                videoPath = str(flvFiles[0])
+            else:
+                # Multi-segment on-disk recording — merge before continuing.
+                merged = await self._mergeFlvSegments([str(p) for p in flvFiles])
+                videoPath = merged or str(flvFiles[-1])
+                if not merged:
+                    log.warning(
+                        f"FLV merge unavailable — falling back to last segment only: {videoPath}"
+                    )
         audioPath = videoPath.rsplit(".", 1)[0] + ".aac"
         danmakuPath = os.path.join(self.outputDir, f"{self.webRid}_danmaku.jsonl")
 
@@ -295,29 +316,38 @@ class Controller:
             from src.signalVisual import extractFeatures
             extractFeatures(vidPath, outputPath=outPath)
 
+        # Track which signal extractors actually succeeded — passes through
+        # to pipeline_status.json so a "failed" extractor is visible instead
+        # of silently producing an empty features file downstream.
+        signalErrors: dict[str, str] = {}
+
         with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = []
+            futures: dict[str, Any] = {}
             if not os.path.exists(audioFeatPath):
-                futures.append(pool.submit(_runAudio, audioPath, audioFeatPath))
+                futures["audio"] = pool.submit(_runAudio, audioPath, audioFeatPath)
             else:
                 log.info(f"  Audio features exist, skipping: {audioFeatPath}")
 
             if not os.path.exists(textFeatPath):
                 if os.path.exists(danmakuPath) and os.path.exists(asrPath):
-                    futures.append(pool.submit(_runText, danmakuPath, asrPath, textFeatPath))
+                    futures["text"] = pool.submit(_runText, danmakuPath, asrPath, textFeatPath)
                 else:
                     log.warning("  Missing danmaku or ASR — text features will be empty")
+                    signalErrors["text"] = "missing inputs (danmaku or ASR)"
 
             if not os.path.exists(visualFeatPath):
-                futures.append(pool.submit(_runVisual, videoPath, visualFeatPath))
+                futures["visual"] = pool.submit(_runVisual, videoPath, visualFeatPath)
             else:
                 log.info(f"  Visual features exist, skipping: {visualFeatPath}")
 
-            for f in futures:
+            for name, f in futures.items():
                 try:
                     f.result()
-                except Exception:
-                    log.error("Signal extraction failed", exc_info=True)
+                except Exception as e:
+                    log.error(f"{name} signal extraction failed", exc_info=True)
+                    # First line of the error is enough for the status file —
+                    # the full traceback already went to the log.
+                    signalErrors[name] = f"{type(e).__name__}: {e}"
 
         # Load features for scorer
         audioFeat = None
@@ -375,26 +405,42 @@ class Controller:
         # Step 9: Generate segment-level SRT + thumbnails
         log.info("Step 9: Generating subtitles and thumbnails...")
         srtPath = asrPath.rsplit(".", 1)[0] + ".srt"
+        srtFailures = 0
+        thumbFailures = 0
         for i, clipPath in enumerate(clipPaths):
             clip = result["clips"][i]
-            # Generate clip-specific SRT
+            # Generate clip-specific SRT — best effort, the clip itself is
+            # already produced and usable without subtitles.
             clipSrtPath = clipPath.rsplit(".", 1)[0] + ".srt"
             try:
                 generateClipSrt(srtPath, clip["start"], clip["end"], clipSrtPath)
             except Exception:
-                pass
-            # Thumbnail
+                srtFailures += 1
+                log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)
+            # Thumbnail — same: best effort
             thumbPath = clipPath.rsplit(".", 1)[0] + ".jpg"
             try:
                 extractThumbnail(videoPath, clip["thumbnailTime"], thumbPath)
             except Exception:
-                pass
+                thumbFailures += 1
+                log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
+        if srtFailures:
+            log.warning(f"{srtFailures}/{len(clipPaths)} clips have no SRT")
+        if thumbFailures:
+            log.warning(f"{thumbFailures}/{len(clipPaths)} clips have no thumbnail")
 
         log.info("=" * 50)
         log.info(f"Clipping complete: {len(clipPaths)} clips → {highlightsDir}")
         log.info("=" * 50)
 
-        # Write pipeline status
+        # Write pipeline status. Each extractor records "ok" / "skipped" /
+        # "failed: <reason>" so a missing features file is distinguishable
+        # from a crashed extractor.
+        def _stepStatus(name: str, outPath: str) -> str:
+            if name in signalErrors:
+                return f"failed: {signalErrors[name]}"
+            return "ok" if os.path.exists(outPath) else "skipped"
+
         statusPath = os.path.join(self.outputDir, "pipeline_status.json")
         status = {
             "roomId": self.webRid,
@@ -403,9 +449,9 @@ class Controller:
             "steps": {
                 "1_audio_extract": "ok",
                 "2_asr": "ok" if os.path.exists(asrPath) else "skipped",
-                "4_audio_signal": "ok" if os.path.exists(audioFeatPath) else "skipped",
-                "5_text_signal": "ok" if os.path.exists(textFeatPath) else "skipped",
-                "6_visual_signal": "ok" if os.path.exists(visualFeatPath) else "skipped",
+                "4_audio_signal": _stepStatus("audio", audioFeatPath),
+                "5_text_signal": _stepStatus("text", textFeatPath),
+                "6_visual_signal": _stepStatus("visual", visualFeatPath),
                 "7_scorer": "ok" if result.get("clips") else "no_clips",
                 "8_clipping": "ok" if clipPaths else "no_clips",
             },
@@ -430,6 +476,63 @@ class Controller:
                 log.warning(f"Audio extraction failed (code={proc.returncode}): {errMsg}")
         except FileNotFoundError:
             log.warning("ffmpeg not installed")
+
+    async def _mergeFlvSegments(self, segments: list[str]) -> str | None:
+        """Concat FLV segments losslessly into a single MP4.
+
+        Why merge instead of feeding ffmpeg a list each time downstream?
+        Every later step (audio extract, ASR, signal extraction, clipping)
+        assumes ONE continuous timeline.  Per-segment processing would
+        force every stage to thread offsets through, which is exactly the
+        kind of "manual time alignment" that goes wrong silently.
+
+        Uses ffmpeg's concat demuxer with stream copy — no re-encode, no
+        quality loss, takes seconds even for hours of footage.  Returns
+        the merged path on success, or the single input path when there's
+        only one segment, or None when ffmpeg isn't available.
+        """
+        valid = [s for s in segments if s and os.path.exists(s)]
+        if not valid:
+            return None
+        if len(valid) == 1:
+            return valid[0]
+
+        outPath = os.path.join(self.outputDir, f"{self.webRid}_merged.mp4")
+        if os.path.exists(outPath):
+            log.info(f"Reusing merged file: {outPath}")
+            return outPath
+
+        # ffmpeg concat demuxer requires a list file with `file '<path>'` lines.
+        listPath = os.path.join(self.outputDir, ".concat_list.txt")
+        try:
+            with open(listPath, "w", encoding="utf-8") as fh:
+                for seg in valid:
+                    # Absolute path + single-quote escape (rare in our names but safe)
+                    abs_seg = os.path.abspath(seg).replace("'", "'\\''")
+                    fh.write(f"file '{abs_seg}'\n")
+
+            log.info(f"Merging {len(valid)} FLV segments → {outPath}")
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-f", "concat", "-safe", "0",
+                "-i", listPath, "-c", "copy",
+                "-bsf:a", "aac_adtstoasc", "-y", outPath,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not os.path.exists(outPath):
+                errMsg = stderr.decode(errors="replace")[-300:] if stderr else ""
+                log.warning(f"FLV merge failed (code={proc.returncode}): {errMsg}")
+                return None
+            log.info(f"Merged: {outPath} ({fmtSize(os.path.getsize(outPath))})")
+            return outPath
+        except FileNotFoundError:
+            log.warning("ffmpeg not installed — cannot merge FLV segments")
+            return None
+        finally:
+            try:
+                os.remove(listPath)
+            except OSError:
+                pass
 
 
 

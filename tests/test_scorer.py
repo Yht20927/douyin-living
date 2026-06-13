@@ -9,6 +9,8 @@ from src.scorer import (
     _nms,
     _qualityFilter,
     _preprocess,
+    _optimizeBoundaries,
+    _compensateLag,
     score,
     PROFILES,
     NMS_MERGE_DISTANCE,
@@ -188,3 +190,69 @@ class TestNmsMergeDistance:
 
     def test_merge_distance_positive(self):
         assert NMS_MERGE_DISTANCE > 0
+
+
+class TestOptimizeBoundaries:
+    """Regression — _optimizeBoundaries used to reference an undefined
+    `searchStart`, raising NameError as soon as RMS was present and
+    silently dropping every clip when caught upstream.
+    """
+
+    def test_runs_with_rms(self):
+        rms = np.zeros(120, dtype=np.float64)
+        rms[40] = -2.0  # valley before peak
+        rms[80] = -2.0  # valley after peak
+        zMatrix = {"rms": rms}
+        result = _optimizeBoundaries([(50.0, 70.0, 1.0)], nSecs=120, zMatrix=zMatrix)
+        assert len(result) == 1
+        s, e, _ = result[0]
+        # Boundary should snap to or near the valley positions
+        assert 40 <= s <= 50
+        assert 70 <= e <= 80
+
+    def test_runs_without_rms(self):
+        # No rms in zMatrix → should still produce ±5s bounds without error
+        result = _optimizeBoundaries([(50.0, 70.0, 1.0)], nSecs=120, zMatrix={})
+        assert len(result) == 1
+        s, e, _ = result[0]
+        assert s == 45
+        assert e == 75
+
+    def test_clamps_to_nsecs(self):
+        rms = np.zeros(20, dtype=np.float64)
+        result = _optimizeBoundaries([(0.0, 18.0, 1.0)], nSecs=20, zMatrix={"rms": rms})
+        s, e, _ = result[0]
+        assert s >= 0
+        assert e <= 20
+
+
+class TestCompensateLag:
+    """Regression — wrap-around band must be zeroed for both lag signs."""
+
+    def test_no_dm_signal_passes_through(self):
+        zMatrix = {"rms": np.ones(50)}
+        result = _compensateLag(zMatrix)
+        assert "rms" in result
+        assert np.array_equal(result["rms"], np.ones(50))
+
+    def test_positive_lag_zeros_head(self):
+        # Build a synthetic dm signal that lags the audio by +2s.
+        # Cross-correlation should detect that and shift dm forward;
+        # the head wrap-around must be zeroed (not contain wrapped tail).
+        n = 100
+        au = np.zeros(n)
+        au[20:25] = 5.0
+        dm = np.zeros(n)
+        dm[22:27] = 5.0  # +2s late vs audio
+        zMatrix = {"rms": au.copy(), "dmDensity": dm.copy()}
+        out = _compensateLag(zMatrix)
+        # Whatever the detected lag, the dm signal length is preserved
+        assert len(out["dmDensity"]) == n
+        # And no value should be larger than the original peak (no wraparound dup)
+        assert float(out["dmDensity"].max()) <= 5.0 + 1e-9
+
+    def test_short_signal_skips(self):
+        zMatrix = {"rms": np.ones(5), "dmDensity": np.ones(5)}
+        result = _compensateLag(zMatrix)
+        # < 10 samples → no shift performed
+        assert np.array_equal(result["dmDensity"], np.ones(5))

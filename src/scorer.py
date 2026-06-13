@@ -244,30 +244,46 @@ def _preprocess(features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 
 def _compensateLag(zMatrix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Cross-correlation lag compensation between danmaku and audio."""
+    """Cross-correlation lag compensation between danmaku and audio.
+
+    Estimates the integer shift (in seconds) that maximises correlation
+    between the first dm-prefixed signal and the first audio signal,
+    then rolls all dm signals by that shift, zeroing the wrap-around
+    region so wrapped samples never re-enter as fake spikes.
+    """
     dmKeys = [k for k in zMatrix if k.startswith("dm")]
     audioKeys = [k for k in zMatrix if k in ("rms", "eventLaughter", "eventApplause")]
 
-    if dmKeys and audioKeys:
-        dmSig = zMatrix[dmKeys[0]]
-        auSig = zMatrix[audioKeys[0]]
-        minLen = min(len(dmSig), len(auSig))
-        if minLen > 10:
-            try:
-                corr = sp_signal.correlate(dmSig[:minLen], auSig[:minLen])
-                lag = np.argmax(corr) - (minLen - 1)
-                if abs(lag) <= 5 and abs(lag) > 0:
-                    log.debug(f"Danmaku→Audio lag: {lag}s — shifting dm signals")
-                    # Shift all dm-prefixed signals by lag
-                    for k in list(zMatrix.keys()):
-                        if k.startswith("dm"):
-                            zMatrix[k] = np.roll(zMatrix[k], -lag)
-                            if lag > 0:
-                                zMatrix[k][-lag:] = 0
-                            else:
-                                zMatrix[k][:-lag] = 0
-            except Exception:
-                pass
+    if not (dmKeys and audioKeys):
+        return zMatrix
+
+    dmSig = zMatrix[dmKeys[0]]
+    auSig = zMatrix[audioKeys[0]]
+    minLen = min(len(dmSig), len(auSig))
+    if minLen <= 10:
+        return zMatrix
+
+    try:
+        corr = sp_signal.correlate(dmSig[:minLen], auSig[:minLen])
+        lag = int(np.argmax(corr) - (minLen - 1))
+        if not (0 < abs(lag) <= 5):
+            return zMatrix
+
+        log.debug(f"Danmaku→Audio lag: {lag}s — shifting dm signals")
+        # np.roll(x, -lag) shifts dm by `-lag`; zero the wrap-around band so
+        # tail/head samples don't reappear at the opposite end as ghost peaks.
+        shift = -lag
+        for k in list(zMatrix.keys()):
+            if not k.startswith("dm"):
+                continue
+            rolled = np.roll(zMatrix[k], shift)
+            if shift > 0:
+                rolled[:shift] = 0       # head wrapped from tail
+            else:
+                rolled[shift:] = 0       # tail wrapped from head (shift is negative)
+            zMatrix[k] = rolled
+    except Exception:
+        log.debug("Lag compensation failed", exc_info=True)
     return zMatrix
 
 
@@ -342,22 +358,26 @@ def _optimizeBoundaries(
         newStart = max(0, s - 5)
         newEnd = min(nSecs, e + 5)
 
-        # Search for valleys (quiet moments) near boundaries
+        # Search for valleys (quiet moments) near boundaries.
+        # Use RMS Z-Score: a true valley sits below the local mean over ±5s.
         rms = zMatrix.get("rms")
-        if rms is not None and len(rms) > searchStart:
-            # Find valley before peak
+        rmsLen = len(rms) if rms is not None else 0
+        if rmsLen > 0:
+            # Find valley before peak — walk back ±10s, snap to first dip
             for offset in range(10, 0, -1):
                 t = int(s) - offset
-                if 0 <= t < nSecs:
-                    if rms[t] < np.mean(rms[max(0, t - 5):min(nSecs, t + 5)]):
+                if 0 <= t < rmsLen:
+                    window = rms[max(0, t - 5):min(rmsLen, t + 5)]
+                    if window.size > 0 and rms[t] < float(np.mean(window)):
                         newStart = t
                         break
 
-            # Find valley after peak
+            # Find valley after peak — walk forward up to 10s
             for offset in range(10):
                 t = int(e) + offset
-                if 0 <= t < nSecs:
-                    if rms[t] < np.mean(rms[max(0, t - 5):min(nSecs, t + 5)]):
+                if 0 <= t < rmsLen:
+                    window = rms[max(0, t - 5):min(rmsLen, t + 5)]
+                    if window.size > 0 and rms[t] < float(np.mean(window)):
                         newEnd = t
                         break
 
@@ -395,7 +415,9 @@ def _qualityFilter(
         if dur < minDur or dur > maxDur:
             continue
 
-        # t-test: scores in clip vs scores immediately before
+        # t-test: scores in clip vs scores immediately before.
+        # Failure here (e.g. zero-variance scores → NaN) shouldn't kill the
+        # clip — fall through to keep it; quality bounds already passed.
         clipScores = score[int(s):int(e)]
         preStart = max(0, int(s) - 5)
         preScores = score[preStart:int(s)]
@@ -405,7 +427,7 @@ def _qualityFilter(
                 if p > 0.05:
                     continue
             except Exception:
-                pass
+                log.debug(f"t-test failed for clip {s}-{e}", exc_info=True)
 
         filtered.append((s, e, sc))
     return filtered

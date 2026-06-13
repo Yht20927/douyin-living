@@ -84,7 +84,9 @@ def extractFeatures(
             if 0 <= motionSec < nSecs:
                 motion[motionSec] = float(np.mean(mag))
         except Exception:
-            pass
+            # Optical flow occasionally fails on bad frames; one bad frame
+            # zeroes only that second instead of crashing the whole sweep.
+            log.debug(f"Optical flow failed at frame {frameCount}", exc_info=True)
         prevGray = currGray
 
         if frameCount % 500 == 0 and frameCount > 0:
