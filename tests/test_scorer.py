@@ -184,6 +184,37 @@ class TestScoreIntegration:
         for name, prof in PROFILES.items():
             assert set(prof.keys()) == default_keys, f"Profile '{name}' keys differ"
 
+    def test_short_recording_produces_clips(self):
+        """Recordings ≤60s must not produce all-zero Z-scores."""
+        n = 30
+        # Flat low-variance baseline + strong spike → t-test should pass
+        rms = np.full(n, 0.1, dtype=np.float64)
+        rms[10:14] = 10.0
+        af = {"features": {"rms": rms.tolist()}}
+        result = score(
+            roomId="test",
+            audioFeatures=af,
+            profile="default",
+            sensitivity=1.0,
+            minDuration=3.0,
+            maxDuration=20.0,
+        )
+        # Should find at least one clip even though n < 60
+        assert len(result["clips"]) >= 1
+
+    def test_very_short_recording_does_not_crash(self):
+        """Recordings < 3s should run without error and return empty clips."""
+        af = {"features": {"rms": [0.1, 0.2, 0.3]}}
+        result = score(
+            roomId="test",
+            audioFeatures=af,
+            profile="default",
+            sensitivity=1.5,
+            minDuration=3.0,
+            maxDuration=20.0,
+        )
+        assert "clips" in result
+
 
 class TestNmsMergeDistance:
     """Verify NMS_MERGE_DISTANCE constant is reasonable."""

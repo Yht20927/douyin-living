@@ -9,6 +9,7 @@ X-Bogus (live danmaku): MD5 + JS signature (dyLiveSign.js via PyExecJS).
 import hashlib
 import random
 import string
+import threading
 import execjs
 from pathlib import Path
 from src.log.logger import getLogger
@@ -23,6 +24,7 @@ _LIVE_SIGN_JS_PATH = _SCRIPT_DIR / "dyLiveSign.js"
 # Cached JS contexts
 _abJs: "execjs._ExternalRuntime.Context | None" = None  # type: ignore
 _liveSignJs: "execjs._ExternalRuntime.Context | None" = None  # type: ignore
+_jsLock = threading.Lock()
 
 
 class Signer:
@@ -83,26 +85,30 @@ class Signer:
     def _getAbJs():
         global _abJs
         if _abJs is None:
-            if not _AB_JS_PATH.exists():
-                raise FileNotFoundError(f"dyAb.js not found at {_AB_JS_PATH}")
-            _abJs = execjs.compile(
-                _AB_JS_PATH.read_text(encoding="utf-8"),
-                cwd=str(_SCRIPT_DIR),
-            )
-            log.info("dyAb.js compiled")
+            with _jsLock:
+                if _abJs is None:
+                    if not _AB_JS_PATH.exists():
+                        raise FileNotFoundError(f"dyAb.js not found at {_AB_JS_PATH}")
+                    _abJs = execjs.compile(
+                        _AB_JS_PATH.read_text(encoding="utf-8"),
+                        cwd=str(_SCRIPT_DIR),
+                    )
+                    log.info("dyAb.js compiled")
         return _abJs
 
     @staticmethod
     def _getLiveSignJs():
         global _liveSignJs
         if _liveSignJs is None:
-            if not _LIVE_SIGN_JS_PATH.exists():
-                raise FileNotFoundError(f"dyLiveSign.js not found at {_LIVE_SIGN_JS_PATH}")
-            _liveSignJs = execjs.compile(
-                _LIVE_SIGN_JS_PATH.read_text(encoding="utf-8"),
-                cwd=str(_SCRIPT_DIR),
-            )
-            log.info("dyLiveSign.js compiled")
+            with _jsLock:
+                if _liveSignJs is None:
+                    if not _LIVE_SIGN_JS_PATH.exists():
+                        raise FileNotFoundError(f"dyLiveSign.js not found at {_LIVE_SIGN_JS_PATH}")
+                    _liveSignJs = execjs.compile(
+                        _LIVE_SIGN_JS_PATH.read_text(encoding="utf-8"),
+                        cwd=str(_SCRIPT_DIR),
+                    )
+                    log.info("dyLiveSign.js compiled")
         return _liveSignJs
 
     # ── Utility ──────────────────────────────────────────────────

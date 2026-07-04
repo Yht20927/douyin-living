@@ -10,7 +10,9 @@ Modes:
 import asyncio
 import json
 import os
+import queue
 import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -72,6 +74,9 @@ class Controller:
         self._flvPath: str | None = None
         self._flvRecorder: FlvRecorder | None = None
         self._recordStartTime: float = 0.0  # wall-clock seconds when recording started
+        self._danmakuQueue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._writerThread: threading.Thread | None = None
+        self._writerStop = threading.Event()
 
     # ── start / stop ───────────────────────────────────────────
 
@@ -89,12 +94,19 @@ class Controller:
         if self._danmakuWs:
             self._danmakuWs.stop()
             self._danmakuWs.join(timeout=3)
+        # Signal and drain the background writer thread so every queued
+        # message is flushed to disk before we proceed.
+        if self._writerThread and self._writerThread.is_alive():
+            self._writerStop.set()
+            self._writerThread.join(timeout=3)
         if self._flvTask:
             self._flvTask.cancel()
             try:
                 await self._flvTask
             except asyncio.CancelledError:
                 pass
+        # Release the shared HTTP client to avoid connection pool leaks.
+        await RoomApi.close()
         log.info(f"Danmaku: {len(self._danmakuMessages)} messages")
         log.info("Controller stopped.")
 
@@ -157,8 +169,7 @@ class Controller:
         def onDanmaku(msg: dict):
             msg["recvTimeSec"] = round(time.time() - self._recordStartTime, 3)
             self._danmakuMessages.append(msg)
-            with open(jsonlPath, "a", encoding="utf-8") as f:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self._danmakuQueue.put(msg)
             msgType = msg.get("type", "?")
             if msgType == "chat":
                 log.info(f"💬 {msg.get('userName','?')}: {msg.get('content','')}")
@@ -171,6 +182,20 @@ class Controller:
             elif msgType == "roomStats":
                 log.info(f"📊 {msg.get('displayShort','')}")
 
+        # Start background writer thread so the WS read loop never blocks on disk I/O.
+        def _writerLoop():
+            with open(jsonlPath, "a", encoding="utf-8") as fh:
+                while not self._writerStop.is_set():
+                    try:
+                        msg = self._danmakuQueue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    fh.flush()
+
+        self._writerThread = threading.Thread(target=_writerLoop, daemon=True)
+        self._writerThread.start()
+
         self._danmakuWs = DanmakuWs(
             params=wsParams.toDict(),
             cookieStr=self._auth.cookieStr,
@@ -179,6 +204,13 @@ class Controller:
         self._danmakuWs.start()
 
         # 6. FLV recording — extract signed URLs from page SSR, use FlvRecorder
+        async def _refreshStreamUrl() -> str:
+            """Callback invoked by FlvRecorder when the signed URL expires."""
+            refreshed = await RoomApi.getStreamUrls(self._auth, self.webRid)
+            if refreshed:
+                return refreshed.get("or4") or refreshed.get("hd") or refreshed.get("sd") or list(refreshed.values())[0]
+            return ""
+
         try:
             streamUrls = await RoomApi.getStreamUrls(self._auth, self.webRid)
             if streamUrls:
@@ -187,6 +219,7 @@ class Controller:
                     roomId=self.webRid,
                     url=flvUrl,
                     outputDir=self.outputDir,
+                    onUrlExpired=_refreshStreamUrl,
                 )
                 # Share the same stop event so Controller.stop() stops the recorder
                 self._flvRecorder._stopEvent = self._stopEvent
@@ -249,7 +282,25 @@ class Controller:
                 log.error(f"No FLV files in {self.outputDir}")
                 return
             if len(flvFiles) == 1:
-                videoPath = str(flvFiles[0])
+                # Re-mux single FLV to MP4 so downstream tools (OpenCV,
+                # scenedetect) get a clean container with valid duration.
+                singleFlv = str(flvFiles[0])
+                remuxed = singleFlv.rsplit(".", 1)[0] + ".mp4"
+                if not os.path.exists(remuxed):
+                    log.info(f"Re-muxing FLV → MP4: {remuxed}")
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-i", singleFlv, "-c", "copy", "-y", remuxed,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode != 0 or not os.path.exists(remuxed):
+                        err = stderr.decode(errors="replace")[-200:] if stderr else ""
+                        log.warning(f"FLV re-mux failed: {err}")
+                        videoPath = singleFlv
+                    else:
+                        videoPath = remuxed
+                else:
+                    videoPath = remuxed
             else:
                 # Multi-segment on-disk recording — merge before continuing.
                 merged = await self._mergeFlvSegments([str(p) for p in flvFiles])
@@ -287,7 +338,8 @@ class Controller:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 log.info(f"ASR device: {device}")
-                transcribe(audioPath, device=device, diarize=True, outputPath=asrPath)
+                # Offload blocking ASR to thread pool so the event loop stays alive
+                await asyncio.to_thread(transcribe, audioPath, device=device, diarize=True, outputPath=asrPath)
             except Exception:
                 log.warning("ASR failed — marking as unavailable", exc_info=True)
                 with open(asrPath, "w") as f:
@@ -394,7 +446,11 @@ class Controller:
         log.info("Step 8: Clipping video...")
         highlightsDir = os.path.join(self.outputDir, "highlights")
         from src.clipper import clipVideo, extractThumbnail, generateClipSrt
-        clipPaths = clipVideo(videoPath, timeTablePath, highlightsDir, dryRun=self.dryRun, resolution=self.resolution)
+        # Offload blocking ffmpeg calls to thread pool
+        clipPaths = await asyncio.to_thread(
+            clipVideo, videoPath, timeTablePath, highlightsDir,
+            dryRun=self.dryRun, resolution=self.resolution,
+        )
 
         if self.dryRun:
             log.info("--dry-run mode: skipping subtitle burn and thumbnails")
@@ -407,8 +463,7 @@ class Controller:
         srtPath = asrPath.rsplit(".", 1)[0] + ".srt"
         srtFailures = 0
         thumbFailures = 0
-        for i, clipPath in enumerate(clipPaths):
-            clip = result["clips"][i]
+        for clipPath, clip in clipPaths:
             # Generate clip-specific SRT — best effort, the clip itself is
             # already produced and usable without subtitles.
             clipSrtPath = clipPath.rsplit(".", 1)[0] + ".srt"

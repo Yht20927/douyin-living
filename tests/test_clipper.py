@@ -88,15 +88,19 @@ class TestGenerateClipSrt:
         generateClipSrt("/nonexistent/path.srt", 0.0, 10.0, out)
         assert not os.path.exists(out)
 
-    def test_partial_overlap_excluded(self):
-        # Entry must be FULLY inside [start, end]; partial overlap = excluded.
+    def test_partial_overlap_truncated(self):
+        # Partial overlap is now kept and truncated to clip boundaries.
         srt = _writeSrt(SAMPLE_SRT)
         out = srt + ".out"
         try:
-            # 6.0–7.5 partially overlaps mid clip (5.5–8.0) but doesn't contain it
+            # 6.0–7.5 partially overlaps mid clip (5.5–8.0)
             generateClipSrt(srt, clipStart=6.0, clipEnd=7.5, outputPath=out)
-            # Nothing fully inside → no output written
-            assert not os.path.exists(out)
+            assert os.path.exists(out)
+            with open(out, encoding="utf-8") as fh:
+                body = fh.read()
+            # Truncated to clip boundaries: 6.0→0.0, 7.5→1.5
+            assert "00:00:00,000 --> 00:00:01,500" in body
+            assert "mid clip" in body
         finally:
             os.remove(srt)
             if os.path.exists(out):

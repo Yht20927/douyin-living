@@ -222,10 +222,17 @@ def _preprocess(features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             smoothed[t] = alpha * arr[t] + (1.0 - alpha) * smoothed[t - 1]
 
         # 2. Rolling Z-Score: (x - μ) / σ over 60s window (vectorized)
-        window = 60
-        if n > window:
-            rollMean = uniform_filter1d(smoothed, size=window + 1, mode="nearest")
-            rollMeanSq = uniform_filter1d(smoothed ** 2, size=window + 1, mode="nearest")
+        # For short recordings (≤60s) fall back to global Z-Score so
+        # clips are still detectable instead of returning all zeros.
+        window = min(60, n)
+        if n >= 3:
+            if n > window:
+                rollMean = uniform_filter1d(smoothed, size=window + 1, mode="nearest")
+                rollMeanSq = uniform_filter1d(smoothed ** 2, size=window + 1, mode="nearest")
+            else:
+                # Global mean / std fallback for short recordings
+                rollMean = np.full(n, np.mean(smoothed))
+                rollMeanSq = np.full(n, np.mean(smoothed ** 2))
             rollStd = np.sqrt(np.maximum(rollMeanSq - rollMean ** 2, 0.0))
             # Avoid div-by-zero: use np.divide with where mask
             with np.errstate(divide="ignore", invalid="ignore"):

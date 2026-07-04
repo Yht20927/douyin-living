@@ -3,6 +3,7 @@
 
 import json
 import hashlib
+import threading
 import numpy as np
 from pathlib import Path
 from collections import Counter
@@ -21,6 +22,13 @@ UTR_THRESHOLD = 0.3
 
 # Default keyword categories (loaded from config/keywords.json)
 _KEYWORD_CONFIG_PATH = Path(__file__).parent.parent / "config" / "keywords.json"
+
+# ── ModelPool name registry ──────────────────────────────────────────
+# Centralised so the test suite (and any future evict-by-name caller)
+# can find these without hard-coding strings everywhere.
+POOL_NAME_FASTTEXT = "fasttext:cc.zh.100"
+POOL_NAME_TEXT2VEC = "text2vec:shibing624-base-chinese"
+POOL_NAME_HF_SENTIMENT = "hf:roberta-jd-binary-chinese"
 
 
 def extractFeatures(
@@ -45,201 +53,234 @@ def extractFeatures(
     """
     log.info(f"Extracting text features: {danmakuPath} + {asrPath}")
 
-    # ── Load keyword config ─────────────────────────────────────
-    kwPath = keywordConfig or str(_KEYWORD_CONFIG_PATH)
-    with open(kwPath, encoding="utf-8") as f:
-        keywordDict = json.load(f)
+    # ── ModelPool bookkeeping ───────────────────────────────────
+    # Every name handed to ``pool.acquire()`` below lands in
+    # ``_holdings`` so the ``finally`` at the bottom can release them.
+    # Without this list the heavy models (FastText, text2vec, HF
+    # sentiment) stay pinned at refcount=1 forever — defeating the
+    # LRU eviction the pool exists to provide.
+    from src.modelPool import ModelPool
+    _pool = ModelPool.instance()
+    _holdings: list[str] = []
 
-    # Build flat keyword list
-    keywords: list[str] = []
-    for cat in keywordDict.values():
-        keywords.extend(cat)
-    keywords = list(set(keywords))
-    log.debug(f"Loaded {len(keywords)} keywords from {len(keywordDict)} categories")
+    try:
+        # ── Load keyword config ─────────────────────────────────
+        kwPath = keywordConfig or str(_KEYWORD_CONFIG_PATH)
+        with open(kwPath, encoding="utf-8") as f:
+            keywordDict = json.load(f)
 
-    # ── Load danmaku ────────────────────────────────────────────
-    log.debug("Loading danmaku...")
-    danmakuEntries: list[dict] = []
-    with open(danmakuPath, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    danmakuEntries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        # Build flat keyword list
+        keywords: list[str] = []
+        for cat in keywordDict.values():
+            keywords.extend(cat)
+        keywords = list(set(keywords))
+        log.debug(f"Loaded {len(keywords)} keywords from {len(keywordDict)} categories")
 
-    log.debug(f"Loaded {len(danmakuEntries)} danmaku messages")
+        # ── Load danmaku ────────────────────────────────────────
+        log.debug("Loading danmaku...")
+        danmakuEntries: list[dict] = []
+        with open(danmakuPath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        danmakuEntries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
 
-    # ── Load ASR ────────────────────────────────────────────────
-    log.debug("Loading ASR...")
-    with open(asrPath, encoding="utf-8") as f:
-        asrData = json.load(f)
+        log.debug(f"Loaded {len(danmakuEntries)} danmaku messages")
 
-    asrSegments = asrData if isinstance(asrData, list) else asrData.get("segments", asrData)
+        # ── Load ASR ────────────────────────────────────────────
+        log.debug("Loading ASR...")
+        with open(asrPath, encoding="utf-8") as f:
+            asrData = json.load(f)
 
-    log.debug(f"Loaded {len(asrSegments)} ASR segments")
-    duration = max(
-        asrSegments[-1].get("end", 0) if asrSegments else 0,
-        len(danmakuEntries) // 10,  # rough estimate
-    )
-    nSecs = int(np.ceil(duration))
+        # Defensive: ASR may output {"status":"failed","segments":[]} or a plain list.
+        if isinstance(asrData, list):
+            asrSegments = asrData
+        elif isinstance(asrData, dict):
+            asrSegments = asrData.get("segments", [])
+        else:
+            asrSegments = []
 
-    # ── Initialize feature arrays ───────────────────────────────
-    dmDensity = [0.0] * nSecs
-    dmUniqueUsers: list[set] = [set() for _ in range(nSecs)]
-    allText30s: list[list[str]] = [[] for _ in range(nSecs)]
-    dmSentimentSum = [0.0] * nSecs
-    dmSentimentCount = [0] * nSecs
-    asrKeyword = [0] * nSecs
-    speakerChange = [0] * nSecs
-    lastSpeakerBySec: dict[int, str] = {}
-
-    # ── Process danmaku ────────────────────────────────────────
-    _jieba_loaded = False
-
-    for entry in danmakuEntries:
-        ts = _parseTimestamp(entry)
-        sec = int(ts)
-        if sec >= nSecs:
-            continue
-
-        content = _getContent(entry)
-        userId = _getUserId(entry)
-
-        dmDensity[sec] += 1.0
-        dmUniqueUsers[sec].add(userId)
-
-        # Text content for sliding window
-        allText30s[sec].append(content)
-
-        # Sentiment
-        try:
-            if not _jieba_loaded:
-                import jieba
-                _jieba_loaded = True
-            words = list(jieba.cut(content))
-            sentiment = _fastSentiment(words)
-            dmSentimentSum[sec] += sentiment
-            dmSentimentCount[sec] += 1
-        except Exception:
-            # One bad message must not derail the whole stream — log at debug
-            # so the volume stays manageable but errors are still inspectable.
-            log.debug("Sentiment failed for one message", exc_info=True)
-
-    # ── Deduplicate users (privacy) ─────────────────────────────
-    uniqueUserCounts = [len(s) for s in dmUniqueUsers]
-    del dmUniqueUsers  # free memory
-
-    # Anti-spam: UTR per 30s window
-    utrRaw = _computeUtr(allText30s)
-
-    # Apply anti-spam penalty
-    dmAdjustedDensity = []
-    for t in range(nSecs):
-        penalty = min(1.0, utrRaw[t] / utrThreshold) if utrRaw[t] > 0 else 1.0
-        dmAdjustedDensity.append(dmDensity[t] * penalty)
-
-    # ── Process ASR ────────────────────────────────────────────
-    log.debug("Processing ASR segments...")
-
-    # Lazy-load FastText + pre-compute keyword vectors ONCE.
-    # Without caching this is O(segments × keywords) get_sentence_vector
-    # calls, which dominates the text pipeline on long recordings.
-    _fastTextModel = None
-    _kwVectors: list[np.ndarray] | None = None
-    _kwNorms: np.ndarray | None = None
-
-    def _ensureFastText():
-        nonlocal _fastTextModel, _kwVectors, _kwNorms
-        if _fastTextModel is not None or _kwVectors is not None:
-            return
-        try:
-            import fasttext
-        except ImportError:
-            log.warning("fasttext not installed — falling back to exact keyword match")
-            _fastTextModel = False  # mark as tried + failed (truthy check below)
-            return
-        modelPath = Path("cc.zh.100.bin")
-        if not modelPath.exists():
-            log.warning("FastText model cc.zh.100.bin not found — falling back to exact match")
-            _fastTextModel = False
-            return
-        _fastTextModel = fasttext.load_model(str(modelPath))
-        # Pre-embed every keyword once (kept as float32 vectors)
-        vecs = [_fastTextModel.get_sentence_vector(kw) for kw in keywords]
-        _kwVectors = [v.astype(np.float32) for v in vecs]
-        _kwNorms = np.array(
-            [np.linalg.norm(v) + 1e-10 for v in _kwVectors], dtype=np.float32
+        log.debug(f"Loaded {len(asrSegments)} ASR segments")
+        duration = max(
+            asrSegments[-1].get("end", 0) if asrSegments else 0,
+            len(danmakuEntries) // 10,  # rough estimate
         )
-        log.debug(f"FastText loaded; pre-embedded {len(_kwVectors)} keywords")
+        nSecs = int(np.ceil(duration))
 
-    for seg in asrSegments:
-        text = seg.get("text", "")
-        if not text:
-            continue
+        # ── Initialize feature arrays ───────────────────────────
+        dmDensity = [0.0] * nSecs
+        dmUniqueUsers: list[set] = [set() for _ in range(nSecs)]
+        allText30s: list[list[str]] = [[] for _ in range(nSecs)]
+        dmSentimentSum = [0.0] * nSecs
+        dmSentimentCount = [0] * nSecs
+        asrKeyword = [0] * nSecs
+        speakerChange = [0] * nSecs
+        lastSpeakerBySec: dict[int, str] = {}
 
-        startSec = int(seg.get("start", 0))
-        endSec = int(np.ceil(seg.get("end", 0)))
-        if endSec >= nSecs:
-            endSec = nSecs - 1
+        # ── Process danmaku ────────────────────────────────────
+        _jieba_loaded = False
 
-        # Keyword matching — compute ONCE per segment, fan out to seconds
-        try:
-            _ensureFastText()
+        for entry in danmakuEntries:
+            ts = _parseTimestamp(entry)
+            sec = int(ts)
+            if sec < 0 or sec >= nSecs:
+                continue
 
-            if _fastTextModel:
-                # Fuzzy matching via FastText — uses pre-embedded keyword vectors
-                hit = _fuzzyMatchCached(text, keywords, _fastTextModel, _kwVectors, _kwNorms)
-            else:
-                # Exact keyword match
-                hit = any(kw in text for kw in keywords)
+            content = _getContent(entry)
+            userId = _getUserId(entry)
 
-            if hit:
+            dmDensity[sec] += 1.0
+            dmUniqueUsers[sec].add(userId)
+
+            # Text content for sliding window
+            allText30s[sec].append(content)
+
+            # Sentiment
+            try:
+                if not _jieba_loaded:
+                    import jieba
+                    _jieba_loaded = True
+                words = list(jieba.cut(content))
+                sentiment = _fastSentiment(words, _pool, _holdings)
+                dmSentimentSum[sec] += sentiment
+                dmSentimentCount[sec] += 1
+            except Exception:
+                # One bad message must not derail the whole stream — log at debug
+                # so the volume stays manageable but errors are still inspectable.
+                log.debug("Sentiment failed for one message", exc_info=True)
+
+        # ── Deduplicate users (privacy) ─────────────────────────
+        uniqueUserCounts = [len(s) for s in dmUniqueUsers]
+        del dmUniqueUsers  # free memory
+
+        # Anti-spam: UTR per 30s window
+        utrRaw = _computeUtr(allText30s)
+
+        # Apply anti-spam penalty
+        dmAdjustedDensity = []
+        for t in range(nSecs):
+            penalty = min(1.0, utrRaw[t] / utrThreshold) if utrRaw[t] > 0 else 1.0
+            dmAdjustedDensity.append(dmDensity[t] * penalty)
+
+        # ── Process ASR ────────────────────────────────────────
+        log.debug("Processing ASR segments...")
+
+        # Lazy-load FastText + pre-compute keyword vectors ONCE.
+        # Without caching this is O(segments × keywords) get_sentence_vector
+        # calls, which dominates the text pipeline on long recordings.
+        _fastTextModel = None
+        _kwVectors: list[np.ndarray] | None = None
+        _kwNorms: np.ndarray | None = None
+
+        def _ensureFastText():
+            nonlocal _fastTextModel, _kwVectors, _kwNorms
+            if _fastTextModel is not None or _kwVectors is not None:
+                return
+            try:
+                import fasttext
+            except ImportError:
+                log.warning("fasttext not installed — falling back to exact keyword match")
+                _fastTextModel = False  # mark as tried + failed (truthy check below)
+                return
+            # Resolve relative to project root so the model is found regardless
+            # of the current working directory.
+            modelPath = Path(__file__).resolve().parents[2] / "models" / "cc.zh.100.bin"
+            if not modelPath.exists():
+                log.warning(f"FastText model {modelPath} not found — falling back to exact match")
+                _fastTextModel = False
+                return
+            # FastText is CPU-only (≈600MB RAM) — gpu=False so it's
+            # cached but never counts against the GPU LRU budget.
+            _fastTextModel = _pool.acquire(
+                POOL_NAME_FASTTEXT,
+                lambda: fasttext.load_model(str(modelPath)),
+                gpu=False,
+            )
+            _holdings.append(POOL_NAME_FASTTEXT)
+            # Pre-embed every keyword once (kept as float32 vectors)
+            vecs = [_fastTextModel.get_sentence_vector(kw) for kw in keywords]
+            _kwVectors = [v.astype(np.float32) for v in vecs]
+            _kwNorms = np.array(
+                [np.linalg.norm(v) + 1e-10 for v in _kwVectors], dtype=np.float32
+            )
+            log.debug(f"FastText loaded; pre-embedded {len(_kwVectors)} keywords")
+
+        for seg in asrSegments:
+            text = seg.get("text", "")
+            if not text:
+                continue
+
+            startSec = int(seg.get("start") or 0)
+            endSec = int(np.ceil(seg.get("end") or 0))
+            if endSec >= nSecs:
+                endSec = nSecs - 1
+
+            # Keyword matching — compute ONCE per segment, fan out to seconds
+            try:
+                _ensureFastText()
+
+                if _fastTextModel:
+                    # Fuzzy matching via FastText — uses pre-embedded keyword vectors
+                    hit = _fuzzyMatchCached(text, keywords, _fastTextModel, _kwVectors, _kwNorms)
+                else:
+                    # Exact keyword match
+                    hit = any(kw in text for kw in keywords)
+
+                if hit:
+                    for sec in range(startSec, endSec):
+                        asrKeyword[sec] = 1
+            except Exception:
+                log.debug("Keyword matching failed for segment", exc_info=True)
+
+            # Speaker change
+            speaker = seg.get("speaker", "")
+            if speaker:
                 for sec in range(startSec, endSec):
-                    asrKeyword[sec] = 1
-        except Exception:
-            log.debug("Keyword matching failed for segment", exc_info=True)
+                    if sec in lastSpeakerBySec and lastSpeakerBySec[sec] != speaker:
+                        speakerChange[sec] = 1
+                    lastSpeakerBySec[sec] = speaker
 
-        # Speaker change
-        speaker = seg.get("speaker", "")
-        if speaker:
-            for sec in range(startSec, endSec):
-                if sec in lastSpeakerBySec and lastSpeakerBySec[sec] != speaker:
-                    speakerChange[sec] = 1
-                lastSpeakerBySec[sec] = speaker
+        # ── Build output ───────────────────────────────────────
+        # Compute entropy from accumulated text
+        dmEntropyRaw = _computeEntropyWindow(allText30s, nSecs)
 
-    # ── Build output ───────────────────────────────────────────
-    # Compute entropy from accumulated text
-    dmEntropyRaw = _computeEntropyWindow(allText30s, nSecs)
+        # Compute topic change (text2vec + KMeans across all windows)
+        topicVec = _computeTopicChange(allText30s, nSecs, _pool, _holdings)
 
-    # Compute topic change (text2vec + KMeans across all windows)
-    topicVec = _computeTopicChange(allText30s, nSecs)
+        features = {
+            "sampleRate": 1,
+            "duration": nSecs,
+            "features": {
+                "dmDensity": dmAdjustedDensity,
+                "dmAcceleration": _secondDerivative(dmAdjustedDensity),
+                "dmEntropy": dmEntropyRaw,
+                "dmSentiment": [dmSentimentSum[i] / dmSentimentCount[i] if dmSentimentCount[i] > 0 else 0.0
+                                for i in range(nSecs)],
+                "dmUniqueUsers": uniqueUserCounts,
+                "dmUtr": utrRaw,
+                "asrKeyword": asrKeyword,
+                "topicChange": topicVec,
+                "speakerChange": speakerChange,
+            },
+        }
 
-    features = {
-        "sampleRate": 1,
-        "duration": nSecs,
-        "features": {
-            "dmDensity": dmAdjustedDensity,
-            "dmAcceleration": _secondDerivative(dmAdjustedDensity),
-            "dmEntropy": dmEntropyRaw,
-            "dmSentiment": [dmSentimentSum[i] / dmSentimentCount[i] if dmSentimentCount[i] > 0 else 0.0
-                            for i in range(nSecs)],
-            "dmUniqueUsers": uniqueUserCounts,
-            "dmUtr": utrRaw,
-            "asrKeyword": asrKeyword,
-            "topicChange": topicVec,
-            "speakerChange": speakerChange,
-        },
-    }
+        if outputPath:
+            with open(outputPath, "w", encoding="utf-8") as f:
+                json.dump(features, f, ensure_ascii=False)
+            log.info(f"Text features saved: {outputPath}")
 
-    if outputPath:
-        with open(outputPath, "w", encoding="utf-8") as f:
-            json.dump(features, f, ensure_ascii=False)
-        log.info(f"Text features saved: {outputPath}")
+        log.info(f"Text features: {nSecs}s, {len(list(features['features'].keys()))} features")
+        return features
 
-    log.info(f"Text features: {nSecs}s, {len(list(features['features'].keys()))} features")
-    return features
+    finally:
+        # Release every name we acquired, even if extraction raised.
+        # Releases drop refcount to 0; the model stays cached until
+        # ModelPool's LRU evicts it.
+        for name in _holdings:
+            _pool.release(name)
 
 
 # ── Internal helpers ──────────────────────────────────────────────
@@ -271,30 +312,65 @@ def _getUserId(entry: dict) -> str:
     return hashlib.sha256(str(raw).encode()).hexdigest()[:16]
 
 
-# Module-level caches for sentiment models
+# Module-level caches for sentiment models.
+# ``_sentimentAvailable`` is the tri-state load probe (None=untried,
+# True=loaded, False=failed) — keeping it module-level means we only
+# pay the import + load attempt once across the whole process.
+# ``_sentimentPipeline`` mirrors what ``ModelPool`` actually owns;
+# the pool keeps the pipeline alive (we hold a ref via ``acquire``)
+# while this attribute lets ``_fastSentiment`` skip a pool lookup
+# on every call.
 _sentimentPipeline = None
 _sentimentAvailable = None  # None=untried, True=loaded, False=failed
+_sentimentLock = threading.Lock()
 
 
-def _fastSentiment(words: list[str]) -> float:
-    """Sentiment analysis — tries HF pipeline once, falls back to rules."""
+def _fastSentiment(words: list[str], pool=None, holdings: list[str] | None = None) -> float:
+    """Sentiment analysis — tries HF pipeline once, falls back to rules.
+
+    Args:
+        words: jieba-tokenised text.
+        pool: optional ModelPool to load the HF pipeline through.  When
+            provided (every call from ``extractFeatures``), the pipeline
+            counts against the GPU LRU budget and is releasable.  When
+            ``None`` (legacy direct callers), the pipeline is loaded
+            inline and stays resident — kept for backward compatibility
+            of the unit tests that patch this helper directly.
+        holdings: list to append the pool name to.  ``extractFeatures``
+            walks this in its ``finally`` to release acquired models.
+    """
     global _sentimentPipeline, _sentimentAvailable
     text = "".join(words)
     if not text.strip():
         return 0.0
 
-    # Try to load HF pipeline exactly once
-    if _sentimentAvailable is None:
-        try:
-            from transformers import pipeline
-            _sentimentPipeline = pipeline(
-                "sentiment-analysis",
-                model="uer/roberta-base-finetuned-jd-binary-chinese",
-            )
-            _sentimentAvailable = True
-        except Exception:
-            log.debug("HF sentiment pipeline unavailable — using rule fallback", exc_info=True)
-            _sentimentAvailable = False  # Mark as tried (even if failed)
+    # Try to load HF pipeline exactly once, protected by lock
+    # so concurrent ThreadPoolExecutor workers don't race to init.
+    with _sentimentLock:
+        if _sentimentAvailable is None:
+            try:
+                from transformers import pipeline
+
+                def _loadPipeline():
+                    return pipeline(
+                        "sentiment-analysis",
+                        model="uer/roberta-base-finetuned-jd-binary-chinese",
+                    )
+
+                if pool is not None:
+                    # GPU=True: this is a 400MB transformer that benefits from
+                    # CUDA when available — it's the canonical LRU candidate.
+                    _sentimentPipeline = pool.acquire(
+                        POOL_NAME_HF_SENTIMENT, _loadPipeline, gpu=True,
+                    )
+                    if holdings is not None:
+                        holdings.append(POOL_NAME_HF_SENTIMENT)
+                else:
+                    _sentimentPipeline = _loadPipeline()
+                _sentimentAvailable = True
+            except Exception:
+                log.debug("HF sentiment pipeline unavailable — using rule fallback", exc_info=True)
+                _sentimentAvailable = False  # Mark as tried (even if failed)
 
     if _sentimentAvailable and _sentimentPipeline:
         try:
@@ -471,7 +547,12 @@ def _computeEntropyWindow(allText30s: list[list[str]], nSecs: int) -> list[float
     return result
 
 
-def _computeTopicChange(allText30s: list[list[str]], nSecs: int) -> list[int]:
+def _computeTopicChange(
+    allText30s: list[list[str]],
+    nSecs: int,
+    pool=None,
+    holdings: list[str] | None = None,
+) -> list[int]:
     """Detect topic shifts using text2vec embeddings + KMeans clustering.
 
     Collects text from 30s windows, embeds each window via text2vec,
@@ -479,6 +560,11 @@ def _computeTopicChange(allText30s: list[list[str]], nSecs: int) -> list[int]:
     and marks second-level transitions where the cluster label changes.
 
     Falls back to all-zero on ImportError (missing deps).
+
+    When called from ``extractFeatures`` the text2vec model is acquired
+    via ``pool`` so it shares the LRU budget; the pool name is appended
+    to ``holdings`` so the caller's ``finally`` releases it.  Direct
+    callers can pass ``pool=None`` and the model loads inline (legacy).
     """
     result = [0] * nSecs
     try:
@@ -507,7 +593,17 @@ def _computeTopicChange(allText30s: list[list[str]], nSecs: int) -> list[int]:
         nonEmptyTexts = [windowTexts[i] for i in nonEmptyIndices]
 
         # ── Embed ──────────────────────────────────────────────
-        model = SentenceModel("shibing624/text2vec-base-chinese")
+        if pool is not None:
+            # text2vec is a ~400MB transformer — runs on GPU when present.
+            model = pool.acquire(
+                POOL_NAME_TEXT2VEC,
+                lambda: SentenceModel("shibing624/text2vec-base-chinese"),
+                gpu=True,
+            )
+            if holdings is not None:
+                holdings.append(POOL_NAME_TEXT2VEC)
+        else:
+            model = SentenceModel("shibing624/text2vec-base-chinese")
         embeddings = model.encode(nonEmptyTexts)
         if embeddings is None or len(embeddings) == 0:
             return result

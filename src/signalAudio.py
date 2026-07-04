@@ -91,50 +91,63 @@ def extractFeatures(
         try:
             from panns_inference import AudioTagging
             import torch
+            from src.modelPool import ModelPool
+
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            pool = ModelPool.instance()
 
-            at = AudioTagging(checkpoint_path=None, device=device, sr=16000)
-            hopSamples = int(sr * 0.5)  # 0.5s hop for panns
+            # Pull panns through ModelPool so a long pipeline (multiple
+            # videos in sequence) doesn't keep stacking event-detection
+            # checkpoints in VRAM.  scope() releases on exit, leaving the
+            # model evictable if another module needs the slot.
+            with pool.scope(
+                "panns:AudioTagging",
+                lambda: AudioTagging(checkpoint_path=None, device=device, sr=16000),
+                gpu=(device == "cuda"),
+            ) as at:
+                hopSamples = int(sr * 0.5)  # 0.5s hop for panns
 
-            # Collect every triggered chunk into a batch first; we'd rather
-            # do one (or a few) GPU forward passes than `triggerCount` of them.
-            # Each chunk is 1.5s of audio (0.5s pre + 1.0s post). panns wants
-            # uniform-length tensors, so right-pad short tails with zeros.
-            chunkLen = hopSamples + int(sr)
-            triggered: list[int] = []
-            chunks: list[np.ndarray] = []
+                # Collect every triggered chunk into a batch first; we'd
+                # rather do one (or a few) GPU forward passes than
+                # `triggerCount` of them.  Each chunk is 1.5s of audio
+                # (0.5s pre + 1.0s post).  panns wants uniform-length
+                # tensors, so right-pad short tails with zeros.
+                chunkLen = hopSamples + int(sr)
+                triggered: list[int] = []
+                chunks: list[np.ndarray] = []
 
-            for t in range(nSecs):
-                if rms1Hz[t] <= rmsMean + PANNS_RMS_THRESHOLD * rmsStd:
-                    continue
-                startSample = max(0, (t * int(sr)) - hopSamples)
-                endSample = min(len(y), (t * int(sr)) + int(sr))
-                chunk = y[startSample:endSample]
-                if len(chunk) < sr // 2:
-                    continue
-                if len(chunk) < chunkLen:
-                    chunk = np.pad(chunk, (0, chunkLen - len(chunk)), mode="constant")
-                else:
-                    chunk = chunk[:chunkLen]
-                triggered.append(t)
-                chunks.append(chunk.astype(np.float32))
+                for t in range(nSecs):
+                    if rms1Hz[t] <= rmsMean + PANNS_RMS_THRESHOLD * rmsStd:
+                        continue
+                    startSample = max(0, (t * int(sr)) - hopSamples)
+                    endSample = min(len(y), (t * int(sr)) + int(sr))
+                    chunk = y[startSample:endSample]
+                    if len(chunk) < sr // 2:
+                        continue
+                    if len(chunk) < chunkLen:
+                        chunk = np.pad(chunk, (0, chunkLen - len(chunk)), mode="constant")
+                    else:
+                        chunk = chunk[:chunkLen]
+                    triggered.append(t)
+                    chunks.append(chunk.astype(np.float32))
 
-            if chunks:
-                # Batch in groups so GPU memory stays bounded.  CUDA gets a
-                # bigger window since we're already paying the launch cost;
-                # CPU stays small to keep latency predictable.
-                batchSize = 32 if device == "cuda" else 8
-                for i in range(0, len(chunks), batchSize):
-                    batch = np.stack(chunks[i:i + batchSize])
-                    clipwise, _ = at.inference(batch)
-                    for j, t in enumerate(triggered[i:i + batchSize]):
-                        eventLaughter[t] = float(clipwise[j, EVENT_LAUGHTER_IDX])
-                        eventApplause[t] = float(clipwise[j, EVENT_APPLAUSE_IDX])
-                        eventMusic[t] = float(clipwise[j, EVENT_MUSIC_IDX])
-                log.debug(
-                    f"panns batch inference: {len(chunks)} chunks "
-                    f"in {(len(chunks) + batchSize - 1) // batchSize} batches"
-                )
+                if chunks:
+                    # Batch in groups so GPU memory stays bounded.  CUDA
+                    # gets a bigger window since we're already paying the
+                    # launch cost; CPU stays small to keep latency
+                    # predictable.
+                    batchSize = 32 if device == "cuda" else 8
+                    for i in range(0, len(chunks), batchSize):
+                        batch = np.stack(chunks[i:i + batchSize])
+                        clipwise, _ = at.inference(batch)
+                        for j, t in enumerate(triggered[i:i + batchSize]):
+                            eventLaughter[t] = float(clipwise[j, EVENT_LAUGHTER_IDX])
+                            eventApplause[t] = float(clipwise[j, EVENT_APPLAUSE_IDX])
+                            eventMusic[t] = float(clipwise[j, EVENT_MUSIC_IDX])
+                    log.debug(
+                        f"panns batch inference: {len(chunks)} chunks "
+                        f"in {(len(chunks) + batchSize - 1) // batchSize} batches"
+                    )
         except ImportError:
             log.warning("panns-inference not installed — skipping event detection")
         except Exception:

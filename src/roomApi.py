@@ -3,6 +3,7 @@
 
 import re
 import json
+import threading
 from typing import Any
 import httpx
 from src.log.logger import getLogger
@@ -31,12 +32,15 @@ class RoomApi:
     """
 
     _client: httpx.AsyncClient | None = None
+    _clientLock = threading.Lock()
 
     @classmethod
     def _get_client(cls) -> httpx.AsyncClient:
-        """Lazy-init and return the shared httpx client."""
+        """Lazy-init and return the shared httpx client (thread-safe)."""
         if cls._client is None:
-            cls._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
+            with cls._clientLock:
+                if cls._client is None:
+                    cls._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
         return cls._client
 
     @classmethod

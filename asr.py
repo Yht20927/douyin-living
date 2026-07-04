@@ -22,7 +22,7 @@ log = getLogger(__name__)
 
 def transcribe(
     audioPath: str,
-    modelSize: str = "large-v3",
+    modelSize: str = "base",
     language: str | None = "zh",
     device: str = "cuda",
     computeType: str = "int8",

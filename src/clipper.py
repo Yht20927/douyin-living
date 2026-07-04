@@ -17,7 +17,7 @@ def clipVideo(
     outputDir: str,
     dryRun: bool = False,
     resolution: str = "720p",
-) -> list[str]:
+) -> list[tuple[str, dict]]:
     """Clip video segments per time_table.json.
 
     Args:
@@ -29,7 +29,9 @@ def clipVideo(
             '720p' (default) uses stream copy; others re-encode with scale.
 
     Returns:
-        List of output file paths.
+        List of (outputPath, originalClipDict) tuples.  The original clip
+        dict is preserved so callers can correlate files with metadata
+        (start, end, trigger, etc.) without relying on fragile index math.
     """
     # Resolution → width:height
     RES_MAP = {"720p": (1280, 720), "1080p": (1920, 1080), "4k": (3840, 2160)}
@@ -41,8 +43,8 @@ def clipVideo(
     with open(timeTablePath, encoding="utf-8") as f:
         data = json.load(f)
 
-    outputs: list[str] = []
-    for i, clip in enumerate(data.get("clips", [])):
+    outputs: list[tuple[str, dict]] = []
+    for clip in data.get("clips", []):
         start = clip["start"]
         end = clip["end"]
         duration = end - start
@@ -77,14 +79,18 @@ def clipVideo(
                 result = subprocess.run(
                     cmd, check=True,
                     capture_output=True, text=True,
+                    timeout=300,
                 )
+            except subprocess.TimeoutExpired:
+                log.error(f"Clip timeout {name}: ffmpeg hung for >300s")
+                continue
             except subprocess.CalledProcessError as e:
                 log.error(f"Clip failed {name}: {e.stderr.strip()[:200] if e.stderr else e}")
                 continue
 
         size = os.path.getsize(outPath) if os.path.exists(outPath) else 0
         log.info(f"✓ {name}.mp4  ({duration:.0f}s, {fmtSize(size)})")
-        outputs.append(outPath)
+        outputs.append((outPath, clip))
 
     log.info(f"Clipping done: {len(outputs)} clips → {outputDir}")
     return outputs
@@ -101,8 +107,11 @@ def extractThumbnail(
     if dryRun:
         log.info(f"[DRY RUN] {' '.join(cmd)}")
     else:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log.info(f"Thumbnail: {outputPath}")
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            log.info(f"Thumbnail: {outputPath}")
+        except subprocess.TimeoutExpired:
+            log.warning(f"Thumbnail timeout: ffmpeg hung for >60s at {timeSec}s")
 
 
 def burnSubtitles(
@@ -117,11 +126,13 @@ def burnSubtitles(
     if dryRun:
         log.info(f"[DRY RUN] {' '.join(cmd)}")
     else:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        if result.returncode == 0:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
             log.info(f"Subtitles burned: {outputPath}")
-        else:
-            log.warning(f"Subtitle burn failed: {result.stderr.strip()[:200] if result.stderr else 'unknown'}")
+        except subprocess.CalledProcessError as e:
+            log.warning(f"Subtitle burn failed: {e.stderr.strip()[:200] if e.stderr else 'unknown'}")
+        except subprocess.TimeoutExpired:
+            log.warning(f"Subtitle burn timeout: ffmpeg hung for >300s")
 
 
 def generateClipSrt(
@@ -153,12 +164,15 @@ def generateClipSrt(
         startSec = sH * 3600 + sM * 60 + sS + sMs / 1000.0
         endSec = eH * 3600 + eM * 60 + eS + eMs / 1000.0
 
-        if startSec >= clipStart and endSec <= clipEnd:
-            counter += 1
-            newStart = startSec - clipStart
-            newEnd = endSec - clipStart
+        # Keep subtitles that overlap with the clip, not just fully-contained.
+        # Truncate to clip boundaries so partial entries are still visible.
+        if endSec < clipStart or startSec > clipEnd:
+            continue
+        counter += 1
+        newStart = max(0.0, startSec - clipStart)
+        newEnd = min(clipEnd - clipStart, endSec - clipStart)
 
-            outBlocks.append(f"{counter}\n{fmtSrtTime(newStart)} --> {fmtSrtTime(newEnd)}\n{text}")
+        outBlocks.append(f"{counter}\n{fmtSrtTime(newStart)} --> {fmtSrtTime(newEnd)}\n{text}")
 
     if outBlocks:
         with open(outputPath, "w", encoding="utf-8") as f:

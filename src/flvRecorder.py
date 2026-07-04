@@ -33,6 +33,7 @@ class FlvRecorder:
         quality: str | None = None,
         outputDir: str | None = None,
         rotationSecs: int = ROTATION_SECS,
+        onUrlExpired: "callable | None" = None,
     ):
         if stream is None and url is None:
             raise ValueError("Either `stream` (StreamInfo) or `url` (str) must be provided")
@@ -43,12 +44,17 @@ class FlvRecorder:
         self.quality = quality or (stream.defaultQuality if stream else "hd")
         self.outputDir = outputDir or os.path.join("data", roomId)
         self.rotationSecs = rotationSecs
+        self._onUrlExpired = onUrlExpired
 
         self._stopEvent = asyncio.Event()
         self._currentFile: str | None = None
         self._bytesWritten: int = 0
         self._startedAt: datetime | None = None
         self._downloadedFiles: list[str] = []
+
+    def updateUrl(self, url: str):
+        """Replace the direct URL (used after expiry refresh)."""
+        self._directUrl = url
 
     @property
     def flvUrl(self) -> str:
@@ -58,6 +64,8 @@ class FlvRecorder:
         try:
             return self.stream.flvUrl(self.quality)
         except KeyError:
+            if not self.stream.flvUrls:
+                raise ValueError("No FLV URLs available in stream info")
             first = next(iter(self.stream.flvUrls.values()))
             log.warning(f"Quality {self.quality} not available, falling back")
             return first
@@ -75,10 +83,29 @@ class FlvRecorder:
 
     async def _downloadLoop(self):
         retries = 0
+        urlRefreshed = False
         while not self._stopEvent.is_set():
             try:
                 await self._downloadSegment()
                 retries = 0
+                urlRefreshed = False
+            except aiohttp.ClientResponseError as e:
+                # 403/404 usually mean the signed URL expired — try to refresh once.
+                if e.status in (403, 404) and self._onUrlExpired and not urlRefreshed:
+                    log.warning(f"URL expired (HTTP {e.status}), refreshing...")
+                    try:
+                        newUrl = await self._onUrlExpired()
+                        if newUrl:
+                            self.updateUrl(newUrl)
+                            urlRefreshed = True
+                            retries = 0
+                            continue
+                    except Exception:
+                        log.exception("URL refresh failed")
+                retries += 1
+                wait = min(2 ** retries, 30)
+                log.error(f"HTTP error (retry {retries} in {wait}s): {e}")
+                await asyncio.wait_for(self._stopEvent.wait(), timeout=wait)
             except aiohttp.ClientError as e:
                 retries += 1
                 wait = min(2 ** retries, 30)

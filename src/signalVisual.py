@@ -37,7 +37,17 @@ def extractFeatures(
     sceneManager.detect_scenes(video)
     sceneList = sceneManager.get_scene_list()
 
+    # PySceneDetect's video.duration may return None/0 for some FLV files.
+    # Fallback to OpenCV frame count / fps when that happens.
     duration = float(video.duration) if video.duration else 0
+    if duration <= 0:
+        capProbe = cv2.VideoCapture(videoPath)
+        frameCount = capProbe.get(cv2.CAP_PROP_FRAME_COUNT)
+        fpsProbe = capProbe.get(cv2.CAP_PROP_FPS) or 30
+        capProbe.release()
+        if frameCount > 0 and fpsProbe > 0:
+            duration = frameCount / fpsProbe
+            log.debug(f"Duration from OpenCV: {duration:.0f}s")
     nSecs = int(np.ceil(duration)) if duration > 0 else 0
     log.debug(f"Duration: {duration:.0f}s, scenes: {len(sceneList)}")
 
