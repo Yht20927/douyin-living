@@ -66,17 +66,26 @@ data/{roomId}/
 ```
 
 ### Scoring Profiles
-Weight profiles in `src/scorer.py` PROFILES dict: `default`, `game`, `shopping`, `talent`. Each assigns weights to ~15 signals (dmDensity, asrKeyword, eventLaughter, rms, motion, etc.). Weights must sum ~1.0.
+Weight profiles in `config/scorer.yaml` (profiles section): `default`, `game`, `shopping`, `talent`. Each assigns weights to ~15 signals (dmDensity, asrKeyword, eventLaughter, rms, motion, etc.). Weights must sum ~1.0. Loaded via `src/config/settings.py`.
 
 ### Protobuf
 - **`src/protobuf/Live_pb2.py`** — Generated from Douyin's LiveResponse proto. Used to decode webcast detail (cursor, internalExt) and WS message frames.
-- **`src/protobuf/decoder.py`** — Decodes binary WS frames → list of message dicts.
+- **`src/protobuf/decoder.py`** — Decodes binary WS frames → list of message dicts. Includes `_encode_varint` with negative-value guard.
 
-### Config
-- **`.env`** — `DY_COOKIES` and `DY_LIVE_COOKIES` (required, 24h expiry)
+### Config System (new in Sprint 2)
+- **`src/config/settings.py`** — Pydantic models for all settings, loaded from YAML with env-var override. Cached via `@lru_cache`. Use `load_settings()` to access, `reload_settings()` to force reload.
+- **`config/scorer.yaml`** — Profiles, preprocessing (EWMA, Z-score), detection (windows, NMS, peak persistence), boundary optimization, t-test, lag compensation
+- **`config/audio.yaml`** — Sample rate, librosa params, panns thresholds/batch sizes, min trigger gap
+- **`config/text.yaml`** — Similarity/UTR thresholds, model paths, window sizes, clustering params
+- **`config/visual.yaml`** — Scene detection threshold, optical flow params, face detection score
+- **`config/recording.yaml`** — FLV rotation, backoff/retry, HTTP timeouts, WS ping interval
+- **`config/pipeline.yaml`** — Default sensitivities, pool workers, ffmpeg timeouts
 - **`config/keywords.json`** — 5 categories: high_energy, funny, controversial, interactive, emotional
 - **`src/log/generalConfig.py`** — Log level, file paths, rotation settings
-- **`src/log/logger.py`** — loguru-based logging with file + console sinks, standard logging interception
+- **`src/log/logger.py`** — loguru-based logging with file + console sinks, standard logging interception. Thread-safe `setLogLevel()`.
+
+### Model Pool
+- **`src/modelPool.py`** — LRU-eviction pool for heavy ML models (panns, FastText, text2vec, HF sentiment). `scope()` context manager auto-releases. Used by signal extractors to avoid stacking models in VRAM.
 
 ## Key Technical Notes
 
@@ -85,8 +94,8 @@ Weight profiles in `src/scorer.py` PROFILES dict: `default`, `game`, `shopping`,
 - **ffmpeg** must be on PATH — used for audio extraction, clipping, subtitle burn, thumbnails.
 - **GPU optional** — CUDA accelerates ASR (faster-whisper). CPU fallback works but is slow.
 - **Model downloads** — First run downloads faster-whisper, panns, FastText, text2vec, HF models (~5GB total).
-- **No test suite** — `tests/verify_modules.py` checks import availability only; no unit tests exist.
-- **Thread safety** — `DanmakuWs` runs in a daemon thread. Signal extraction uses `ThreadPoolExecutor(max_workers=3)`. All JSON I/O is sequential.
+- **Test suite** — 228 tests across 18 test files (pytest). Run: `pytest tests/ -v`. Coverage: ~71%.
+- **Thread safety** — `DanmakuWs` runs in a daemon thread. Signal extraction uses `ThreadPoolExecutor` (workers configurable via `config/pipeline.yaml`). All JSON I/O is sequential. `_danmakuMessages` is a bounded `deque(maxlen=1000)` to prevent memory leaks. FLV writes use `aiofiles` for non-blocking I/O.
 
 ## Conventions
 

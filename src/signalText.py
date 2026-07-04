@@ -8,27 +8,24 @@ import numpy as np
 from pathlib import Path
 from collections import Counter
 from src.log.logger import getLogger
+from src.config import load_settings
 
 log = getLogger(__name__)
+_cfg = load_settings().text
 
 # FastText threshold for fuzzy match
-SIMILARITY_THRESHOLD = 0.7
+SIMILARITY_THRESHOLD = _cfg.similarity_threshold
 
 # Anti-spam UTR (Unique Token Ratio) threshold.
-# Values below this threshold indicate repetitive/spammy text.
-# Normal chat typically has UTR > 0.7; 0.3 only penalises extreme spam.
-# Consider raising to 0.5–0.6 for stricter spam filtering.
-UTR_THRESHOLD = 0.3
+UTR_THRESHOLD = _cfg.utr_threshold
 
 # Default keyword categories (loaded from config/keywords.json)
-_KEYWORD_CONFIG_PATH = Path(__file__).parent.parent / "config" / "keywords.json"
+_KEYWORD_CONFIG_PATH = Path(_cfg.keyword_config_path)
 
 # ── ModelPool name registry ──────────────────────────────────────────
-# Centralised so the test suite (and any future evict-by-name caller)
-# can find these without hard-coding strings everywhere.
 POOL_NAME_FASTTEXT = "fasttext:cc.zh.100"
-POOL_NAME_TEXT2VEC = "text2vec:shibing624-base-chinese"
-POOL_NAME_HF_SENTIMENT = "hf:roberta-jd-binary-chinese"
+POOL_NAME_TEXT2VEC = f"text2vec:{_cfg.text2vec_model.replace('/', '-')}"
+POOL_NAME_HF_SENTIMENT = f"hf:{_cfg.sentiment_model.replace('/', '-').replace('uer-', '')}"
 
 
 def extractFeatures(
@@ -52,6 +49,35 @@ def extractFeatures(
         dict with 'sampleRate', 'duration', 'features' keys.
     """
     log.info(f"Extracting text features: {danmakuPath} + {asrPath}")
+    try:
+        return _extractTextFeaturesImpl(
+            danmakuPath, asrPath, outputPath, keywordConfig, utrThreshold
+        )
+    except Exception:
+        log.exception(f"Text feature extraction failed for {danmakuPath}")
+        empty = {
+            "sampleRate": 1,
+            "duration": 0,
+            "features": {
+                "dmDensity": [], "dmAcceleration": [], "dmEntropy": [],
+                "dmSentiment": [], "dmUtr": [],
+                "asrKeyword": [], "topicChange": [], "speakerChange": [],
+            },
+        }
+        if outputPath:
+            with open(outputPath, "w", encoding="utf-8") as f:
+                json.dump(empty, f, ensure_ascii=False)
+        return empty
+
+
+def _extractTextFeaturesImpl(
+    danmakuPath: str,
+    asrPath: str,
+    outputPath: str | None = None,
+    keywordConfig: str | None = None,
+    utrThreshold: float = UTR_THRESHOLD,
+) -> dict:
+    """Inner implementation — wrapped by extractFeatures with try/except."""
 
     # ── ModelPool bookkeeping ───────────────────────────────────
     # Every name handed to ``pool.acquire()`` below lands in
@@ -187,7 +213,7 @@ def extractFeatures(
                 return
             # Resolve relative to project root so the model is found regardless
             # of the current working directory.
-            modelPath = Path(__file__).resolve().parents[2] / "models" / "cc.zh.100.bin"
+            modelPath = Path(__file__).resolve().parents[2] / _cfg.fasttext_model_path
             if not modelPath.exists():
                 log.warning(f"FastText model {modelPath} not found — falling back to exact match")
                 _fastTextModel = False
@@ -354,7 +380,7 @@ def _fastSentiment(words: list[str], pool=None, holdings: list[str] | None = Non
                 def _loadPipeline():
                     return pipeline(
                         "sentiment-analysis",
-                        model="uer/roberta-base-finetuned-jd-binary-chinese",
+                        model=_cfg.sentiment_model,
                     )
 
                 if pool is not None:
@@ -374,7 +400,7 @@ def _fastSentiment(words: list[str], pool=None, holdings: list[str] | None = Non
 
     if _sentimentAvailable and _sentimentPipeline:
         try:
-            result = _sentimentPipeline(text[:512])[0]
+            result = _sentimentPipeline(text[:_cfg.sentiment_max_len])[0]
             score = result["score"]
             return score if result["label"].upper() == "POSITIVE" else -score
         except Exception:
@@ -406,7 +432,7 @@ def _computeUtr(allText30s: list[list[str]]) -> list[float]:
 
     nSecs = len(allText30s)
     utr = [0.0] * nSecs
-    windowRadius = 30
+    windowRadius = _cfg.utr_window_radius
 
     # Pre-flatten: compute token list per second (materialize once)
     tokensPerSec: list[list[str]] = [
@@ -521,23 +547,21 @@ def _computeEntropyWindow(allText30s: list[list[str]], nSecs: int) -> list[float
     faster and more practical for real-time danmaku streams.
     """
     result = [0.0] * nSecs
+    radius = _cfg.entropy_window_radius
     for t in range(nSecs):
         texts = []
-        for dt in range(-5, 5):  # ±5s = 10s window
+        for dt in range(-radius, radius + 1):
             nt = t + dt
             if 0 <= nt < nSecs:
-                # Take up to 200 messages
-                texts.extend(allText30s[nt][:200])
+                texts.extend(allText30s[nt][:_cfg.entropy_msg_cap])
         if not texts:
             continue
-        # Join and split into tokens
         allWords = " ".join(texts).split()
         wordCounts = Counter(allWords)
-        topWords = [w for w, _ in wordCounts.most_common(50)]
+        topWords = [w for w, _ in wordCounts.most_common(_cfg.entropy_top_words)]
         total = sum(wordCounts.values())
         if total == 0:
             continue
-        # H = -Σ p(w)·log₂(p(w))
         entropy = 0.0
         for w in topWords:
             p = wordCounts[w] / total

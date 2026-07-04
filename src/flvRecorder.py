@@ -7,13 +7,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+import aiofiles
 
 from src.models import StreamInfo
 from src.log.logger import getLogger
+from src.config import load_settings
 
 log = getLogger(__name__)
+_cfg = load_settings().recording
 
-ROTATION_SECS = 30 * 60  # 30 minutes per file
+ROTATION_SECS = _cfg.rotation_secs
 
 
 class FlvRecorder:
@@ -103,12 +106,12 @@ class FlvRecorder:
                     except Exception:
                         log.exception("URL refresh failed")
                 retries += 1
-                wait = min(2 ** retries, 30)
+                wait = min(_cfg.backoff_base ** retries, _cfg.backoff_max)
                 log.error(f"HTTP error (retry {retries} in {wait}s): {e}")
                 await asyncio.wait_for(self._stopEvent.wait(), timeout=wait)
             except aiohttp.ClientError as e:
                 retries += 1
-                wait = min(2 ** retries, 30)
+                wait = min(_cfg.backoff_base ** retries, _cfg.backoff_max)
                 log.error(f"HTTP error (retry {retries} in {wait}s): {e}")
                 await asyncio.wait_for(self._stopEvent.wait(), timeout=wait)
             except asyncio.CancelledError:
@@ -116,9 +119,9 @@ class FlvRecorder:
             except Exception:
                 log.exception("Unexpected error in download loop")
                 retries += 1
-                await asyncio.wait_for(self._stopEvent.wait(), timeout=10)
+                await asyncio.wait_for(self._stopEvent.wait(), timeout=_cfg.unexpected_retry_wait)
 
-            if retries > 5:
+            if retries > _cfg.max_retries:
                 log.error("Too many retries, giving up")
                 break
 
@@ -132,7 +135,10 @@ class FlvRecorder:
 
         log.info(f"Recording FLV → {fpath}")
 
-        timeout = aiohttp.ClientTimeout(total=None, sock_read=30.0)
+        timeout = aiohttp.ClientTimeout(
+            total=_cfg.http_timeout_total,
+            sock_read=_cfg.http_timeout_sock_read,
+        )
         connector = aiohttp.TCPConnector(force_close=True)
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -141,11 +147,11 @@ class FlvRecorder:
                 self._currentFile = fpath
                 self._bytesWritten = 0
 
-                with open(fpath, "wb") as fh:
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                async with aiofiles.open(fpath, "wb") as fh:
+                    async for chunk in resp.content.iter_chunked(_cfg.chunk_size):
                         if self._stopEvent.is_set():
                             break
-                        fh.write(chunk)
+                        await fh.write(chunk)
                         self._bytesWritten += len(chunk)
 
                         elapsed = asyncio.get_event_loop().time() - segmentStart

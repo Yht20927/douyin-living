@@ -4,8 +4,10 @@
 import json
 import numpy as np
 from src.log.logger import getLogger
+from src.config import load_settings
 
 log = getLogger(__name__)
+_cfg = load_settings().visual
 
 
 def extractFeatures(
@@ -24,6 +26,27 @@ def extractFeatures(
         dict with 'sampleRate', 'duration', 'features' keys.
     """
     log.info(f"Extracting visual features: {videoPath}")
+    try:
+        return _extractVisualFeaturesImpl(videoPath, outputPath, faceDetection)
+    except Exception:
+        log.exception(f"Visual feature extraction failed for {videoPath}")
+        empty = {
+            "sampleRate": 1,
+            "duration": 0,
+            "features": {"sceneChange": [], "motion": [], "faceCount": []},
+        }
+        if outputPath:
+            with open(outputPath, "w", encoding="utf-8") as f:
+                json.dump(empty, f, ensure_ascii=False)
+        return empty
+
+
+def _extractVisualFeaturesImpl(
+    videoPath: str,
+    outputPath: str | None = None,
+    faceDetection: bool = False,
+) -> dict:
+    """Inner implementation — wrapped by extractFeatures with try/except."""
 
     from scenedetect import open_video, SceneManager, ContentDetector
     import cv2
@@ -33,7 +56,7 @@ def extractFeatures(
     # ── Scene detection ────────────────────────────────────────
     log.debug("Running scene detection (PySceneDetect)...")
     sceneManager = SceneManager()
-    sceneManager.add_detector(ContentDetector(threshold=27.0))
+    sceneManager.add_detector(ContentDetector(threshold=_cfg.scene_threshold))
     sceneManager.detect_scenes(video)
     sceneList = sceneManager.get_scene_list()
 
@@ -43,7 +66,7 @@ def extractFeatures(
     if duration <= 0:
         capProbe = cv2.VideoCapture(videoPath)
         frameCount = capProbe.get(cv2.CAP_PROP_FRAME_COUNT)
-        fpsProbe = capProbe.get(cv2.CAP_PROP_FPS) or 30
+        fpsProbe = capProbe.get(cv2.CAP_PROP_FPS) or _cfg.fps_fallback
         capProbe.release()
         if frameCount > 0 and fpsProbe > 0:
             duration = frameCount / fpsProbe
@@ -61,15 +84,22 @@ def extractFeatures(
     log.debug("Computing optical flow motion...")
     cap = cv2.VideoCapture(videoPath)
     motion = [0.0] * nSecs
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps = cap.get(cv2.CAP_PROP_FPS) or _cfg.fps_fallback
     if fps == 0:
-        fps = 30
+        fps = _cfg.fps_fallback
+
+    resW, resH = _cfg.opticalflow_resolution
+    sampleInterval = _cfg.opticalflow_sample_interval
 
     ret, prevFrame = cap.read()
     prevGray = None
     if ret:
         prevGray = cv2.cvtColor(prevFrame, cv2.COLOR_BGR2GRAY)
-        prevGray = cv2.resize(prevGray, (320, 240))  # reduce for speed
+        prevGray = cv2.resize(prevGray, (resW, resH))  # reduce for speed
+
+    # Accumulate motion magnitude per second (multiple samples per second
+    # are averaged instead of overwriting each other).
+    motionSamples: dict[int, list[float]] = {}
 
     frameCount = 0
     while True:
@@ -78,21 +108,28 @@ def extractFeatures(
             break
         frameCount += 1
 
-        # Sample every 5 frames (1/5 of fps)
-        if frameCount % 5 != 0:
+        # Sample at configured interval
+        if frameCount % sampleInterval != 0:
             continue
 
         currGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        currGray = cv2.resize(currGray, (320, 240))
+        currGray = cv2.resize(currGray, (resW, resH))
 
         try:
             flow = cv2.calcOpticalFlowFarneback(
-                prevGray, currGray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                prevGray, currGray, None,
+                _cfg.farneback_pyr_scale,
+                _cfg.farneback_levels,
+                _cfg.farneback_winsize,
+                _cfg.farneback_iterations,
+                _cfg.farneback_poly_n,
+                _cfg.farneback_poly_sigma,
+                _cfg.farneback_flags,
             )
             mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
             motionSec = int(frameCount / fps)
             if 0 <= motionSec < nSecs:
-                motion[motionSec] = float(np.mean(mag))
+                motionSamples.setdefault(motionSec, []).append(float(np.mean(mag)))
         except Exception:
             # Optical flow occasionally fails on bad frames; one bad frame
             # zeroes only that second instead of crashing the whole sweep.
@@ -104,11 +141,15 @@ def extractFeatures(
 
     cap.release()
 
+    # Average accumulated samples per second
+    for sec, samples in motionSamples.items():
+        motion[sec] = sum(samples) / len(samples)
+
     # ── Face detection (Phase 2: only on candidate frames) ─────
     faceCount = [0] * nSecs
     if faceDetection:
         log.debug("Skipping face detection in Phase 1 (use --face to enable)")
-        # Phase 2: insightface on frames where score > 0.6
+        # Phase 2: insightface on frames where score > threshold
 
     # ── Build output ───────────────────────────────────────────
     features = {

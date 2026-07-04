@@ -1,0 +1,12 @@
+scene_threshold: 27.0
+fps_fallback: 30
+opticalflow_resolution: [320, 240]
+opticalflow_sample_interval: 5
+farneback_pyr_scale: 0.5
+farneback_levels: 3
+farneback_winsize: 15
+farneback_iterations: 3
+farneback_poly_n: 5
+farneback_poly_sigma: 1.2
+farneback_flags: 0
+face_score_threshold: 0.6

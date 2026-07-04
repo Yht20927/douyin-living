@@ -14,6 +14,7 @@ import queue
 import signal
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,10 @@ from src.flvRecorder import FlvRecorder
 from src.protobuf.Live_pb2 import LiveResponse
 from src.log.logger import getLogger
 from src.util import fmtSize
+from src.config import load_settings
 
 log = getLogger(__name__)
+_cfg = load_settings().pipeline
 
 
 class Controller:
@@ -46,11 +49,11 @@ class Controller:
         clip: bool = False,
         clipOnly: bool = False,
         profile: str = "default",
-        sensitivity: float = 2.5,
-        minDuration: float = 15.0,
-        maxDuration: float = 90.0,
+        sensitivity: float | None = None,
+        minDuration: float | None = None,
+        maxDuration: float | None = None,
         preprocess: bool = False,
-        resolution: str = "720p",
+        resolution: str | None = None,
         dryRun: bool = False,
         outputDir: str | None = None,
     ):
@@ -58,11 +61,11 @@ class Controller:
         self.clip = clip
         self.clipOnly = clipOnly
         self.profile = profile
-        self.sensitivity = sensitivity
-        self.minDuration = minDuration
-        self.maxDuration = maxDuration
+        self.sensitivity = sensitivity if sensitivity is not None else _cfg.sensitivity_default
+        self.minDuration = minDuration if minDuration is not None else _cfg.min_duration_default
+        self.maxDuration = maxDuration if maxDuration is not None else _cfg.max_duration_default
         self.preprocess = preprocess
-        self.resolution = resolution
+        self.resolution = resolution or _cfg.resolution_default
         self.dryRun = dryRun
         self.outputDir = outputDir or os.path.join("data", webRid)
 
@@ -70,7 +73,11 @@ class Controller:
         self._danmakuWs: DanmakuWs | None = None
         self._flvTask: asyncio.Task | None = None
         self._stopEvent = asyncio.Event()
-        self._danmakuMessages: list[dict[str, Any]] = []
+        # Use bounded deque to prevent unbounded memory growth during
+        # long recordings (previously a plain list that could hold
+        # hundreds of thousands of dicts).
+        self._danmakuMessages: deque[dict[str, Any]] = deque(maxlen=1000)
+        self._danmakuCount: int = 0
         self._flvPath: str | None = None
         self._flvRecorder: FlvRecorder | None = None
         self._recordStartTime: float = 0.0  # wall-clock seconds when recording started
@@ -93,12 +100,12 @@ class Controller:
         log.info("Stopping controller...")
         if self._danmakuWs:
             self._danmakuWs.stop()
-            self._danmakuWs.join(timeout=3)
+            self._danmakuWs.join(timeout=_cfg.ws_join_timeout)
         # Signal and drain the background writer thread so every queued
         # message is flushed to disk before we proceed.
         if self._writerThread and self._writerThread.is_alive():
             self._writerStop.set()
-            self._writerThread.join(timeout=3)
+            self._writerThread.join(timeout=_cfg.writer_join_timeout)
         if self._flvTask:
             self._flvTask.cancel()
             try:
@@ -107,7 +114,7 @@ class Controller:
                 pass
         # Release the shared HTTP client to avoid connection pool leaks.
         await RoomApi.close()
-        log.info(f"Danmaku: {len(self._danmakuMessages)} messages")
+        log.info(f"Danmaku: {self._danmakuCount} messages")
         log.info("Controller stopped.")
 
     # ── Recording phase (existing) ─────────────────────────────
@@ -169,6 +176,7 @@ class Controller:
         def onDanmaku(msg: dict):
             msg["recvTimeSec"] = round(time.time() - self._recordStartTime, 3)
             self._danmakuMessages.append(msg)
+            self._danmakuCount += 1
             self._danmakuQueue.put(msg)
             msgType = msg.get("type", "?")
             if msgType == "chat":
@@ -187,7 +195,7 @@ class Controller:
             with open(jsonlPath, "a", encoding="utf-8") as fh:
                 while not self._writerStop.is_set():
                     try:
-                        msg = self._danmakuQueue.get(timeout=0.5)
+                        msg = self._danmakuQueue.get(timeout=_cfg.queue_timeout)
                     except queue.Empty:
                         continue
                     fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
@@ -373,7 +381,7 @@ class Controller:
         # of silently producing an empty features file downstream.
         signalErrors: dict[str, str] = {}
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=_cfg.signal_pool_workers) as pool:
             futures: dict[str, Any] = {}
             if not os.path.exists(audioFeatPath):
                 futures["audio"] = pool.submit(_runAudio, audioPath, audioFeatPath)
@@ -401,20 +409,11 @@ class Controller:
                     # the full traceback already went to the log.
                     signalErrors[name] = f"{type(e).__name__}: {e}"
 
-        # Load features for scorer
-        audioFeat = None
-        textFeat = None
-        visualFeat = None
-
-        if os.path.exists(audioFeatPath):
-            with open(audioFeatPath) as f:
-                audioFeat = json.load(f)
-        if os.path.exists(textFeatPath):
-            with open(textFeatPath) as f:
-                textFeat = json.load(f)
-        if os.path.exists(visualFeatPath):
-            with open(visualFeatPath) as f:
-                visualFeat = json.load(f)
+        # Load features for scorer (defensively — null values in JSON are
+        # replaced with empty feature dicts to prevent downstream crashes).
+        audioFeat = self._safe_load_features(audioFeatPath)
+        textFeat = self._safe_load_features(textFeatPath)
+        visualFeat = self._safe_load_features(visualFeatPath)
 
         if not audioFeat and not textFeat and not visualFeat:
             log.error("No features extracted — cannot score")
@@ -468,14 +467,18 @@ class Controller:
             # already produced and usable without subtitles.
             clipSrtPath = clipPath.rsplit(".", 1)[0] + ".srt"
             try:
-                generateClipSrt(srtPath, clip["start"], clip["end"], clipSrtPath)
+                await asyncio.to_thread(
+                    generateClipSrt, srtPath, clip["start"], clip["end"], clipSrtPath,
+                )
             except Exception:
                 srtFailures += 1
                 log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)
-            # Thumbnail — same: best effort
+            # Thumbnail — same: best effort, offloaded to thread
             thumbPath = clipPath.rsplit(".", 1)[0] + ".jpg"
             try:
-                extractThumbnail(videoPath, clip["thumbnailTime"], thumbPath)
+                await asyncio.to_thread(
+                    extractThumbnail, videoPath, clip["thumbnailTime"], thumbPath,
+                )
             except Exception:
                 thumbFailures += 1
                 log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
@@ -516,6 +519,36 @@ class Controller:
         with open(statusPath, "w") as f:
             json.dump(status, f, ensure_ascii=False, indent=2)
         log.info(f"Pipeline status: {statusPath}")
+
+    # ── helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe_load_features(path: str) -> dict | None:
+        """Load a JSON features file, replacing null values with safe defaults.
+
+        Returns None if the file doesn't exist; otherwise returns the parsed
+        dict with any null feature values replaced by empty dicts/lists.
+        """
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"Failed to parse {path}: {e}")
+            return None
+
+        # Guard: if the top-level "features" key is null/missing, default it.
+        if isinstance(data, dict):
+            features = data.get("features")
+            if features is None:
+                data["features"] = {}
+            elif isinstance(features, dict):
+                # Replace any null feature arrays with empty lists
+                for key, val in list(features.items()):
+                    if val is None:
+                        features[key] = []
+        return data
 
     async def _extractAudio(self, flvPath: str, audioPath: str):
         try:
@@ -590,9 +623,6 @@ class Controller:
                 pass
 
 
-
-
-
 # ── CLI ──────────────────────────────────────────────────────────
 
 async def main():
@@ -605,11 +635,11 @@ async def main():
     parser.add_argument("--clip-only", action="store_true", help="Only run AI clipping on recorded files")
     parser.add_argument("--profile", default="default", choices=["default", "game", "shopping", "talent"],
                         help="Weight profile for scoring")
-    parser.add_argument("--sensitivity", type=float, default=2.5, help="Peak detection sensitivity (2.0-3.5)")
-    parser.add_argument("--min-duration", type=float, default=15.0, help="Minimum clip duration in seconds")
-    parser.add_argument("--max-duration", type=float, default=90.0, help="Maximum clip duration in seconds")
+    parser.add_argument("--sensitivity", type=float, default=None, help="Peak detection sensitivity (2.0-3.5)")
+    parser.add_argument("--min-duration", type=float, default=None, help="Minimum clip duration in seconds")
+    parser.add_argument("--max-duration", type=float, default=None, help="Maximum clip duration in seconds")
     parser.add_argument("--preprocess", action="store_true", help="Enable auto-editor preprocessing")
-    parser.add_argument("--resolution", default="720p", choices=["720p", "1080p", "4k"],
+    parser.add_argument("--resolution", default=None, choices=["720p", "1080p", "4k"],
                         help="Output resolution")
     parser.add_argument("--dry-run", action="store_true", help="Only output time table, skip clipping")
     parser.add_argument("--output-dir", help="Override output directory")

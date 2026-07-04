@@ -253,7 +253,13 @@ def encode_frame(frame: Frame) -> bytes:
 
 
 def _encode_varint(value: int) -> bytes:
-    """Encode an unsigned integer as a varint."""
+    """Encode an unsigned integer as a varint.
+
+    Raises ValueError for negative values, which would otherwise
+    cause an infinite loop (Python's >> on negative ints preserves sign).
+    """
+    if value < 0:
+        raise ValueError(f"varint does not support negative values: {value}")
     result = []
     while value > 0x7F:
         result.append((value & 0x7F) | 0x80)

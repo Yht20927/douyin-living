@@ -15,49 +15,19 @@ import numpy as np
 from scipy import signal as sp_signal, stats as sp_stats
 from src.log.logger import getLogger
 from src.util import FEATURE_NAMES, validateFeatures
+from src.config import load_settings
 
 log = getLogger(__name__)
 
-# Default weights per profile
-PROFILES = {
-    "default": {
-        "dmDensity": 0.15, "dmAcceleration": 0.05, "dmEntropy": 0.05,
-        "dmSentiment": 0.10, "dmUtr": 0.03,
-        "asrKeyword": 0.10, "topicChange": 0.05, "speakerChange": 0.05,
-        "rms": 0.10, "mfccDist": 0.02,
-        "eventLaughter": 0.10, "eventApplause": 0.05, "eventMusic": 0.05,
-        "sceneChange": 0.05, "motion": 0.05, "faceCount": 0.00,
-    },
-    "game": {
-        "dmDensity": 0.20, "dmAcceleration": 0.10, "dmEntropy": 0.05,
-        "dmSentiment": 0.05, "dmUtr": 0.03,
-        "asrKeyword": 0.08, "topicChange": 0.05, "speakerChange": 0.03,
-        "rms": 0.08, "mfccDist": 0.02,
-        "eventLaughter": 0.10, "eventApplause": 0.10, "eventMusic": 0.03,
-        "sceneChange": 0.05, "motion": 0.10, "faceCount": 0.00,
-    },
-    "shopping": {
-        "dmDensity": 0.10, "dmAcceleration": 0.03, "dmEntropy": 0.03,
-        "dmSentiment": 0.05, "dmUtr": 0.03,
-        "asrKeyword": 0.20, "topicChange": 0.05, "speakerChange": 0.05,
-        "rms": 0.05, "mfccDist": 0.02,
-        "eventLaughter": 0.05, "eventApplause": 0.05, "eventMusic": 0.05,
-        "sceneChange": 0.05, "motion": 0.03, "faceCount": 0.00,
-    },
-    "talent": {
-        "dmDensity": 0.10, "dmAcceleration": 0.05, "dmEntropy": 0.03,
-        "dmSentiment": 0.15, "dmUtr": 0.03,
-        "asrKeyword": 0.10, "topicChange": 0.05, "speakerChange": 0.10,
-        "rms": 0.20, "mfccDist": 0.02,
-        "eventLaughter": 0.05, "eventApplause": 0.05, "eventMusic": 0.05,
-        "sceneChange": 0.03, "motion": 0.03, "faceCount": 0.00,
-    },
-}
+# Load scorer configuration (cached; call load_settings.cache_clear() to reload)
+_cfg = load_settings().scorer
 
-DETECTION_WINDOWS = [3, 10, 30]
-NMS_MERGE_DISTANCE = 15.0
-MIN_CLIP_DURATION = 15.0
-MAX_CLIP_DURATION = 90.0
+# Re-export profiles for backward compatibility with existing tests
+PROFILES = _cfg.profiles
+DETECTION_WINDOWS = _cfg.detection.windows
+NMS_MERGE_DISTANCE = _cfg.detection.nms_merge_distance
+MIN_CLIP_DURATION = _cfg.detection.min_clip_duration
+MAX_CLIP_DURATION = _cfg.detection.max_clip_duration
 
 
 def score(
@@ -130,11 +100,11 @@ def score(
         if w <= 0 or len(z) != nSecs:
             continue
         diff = np.abs(np.diff(z, prepend=z[0]))
-        boost += w * np.tanh(diff / 2.0)
+        boost += w * np.tanh(diff / _cfg.boost.tanh_divisor)
 
-    # Time decay: exp(-|t - candidate| / τ), τ=5s
+    # Time decay: exp(-|t - candidate| / τ)
     # Applied per-candidate in _detectPeaks, but also apply globally:
-    decayGlobal = np.exp(-np.arange(nSecs) / max(nSecs, 1) * 0.1)  # slow global decay
+    decayGlobal = np.exp(-np.arange(nSecs) / max(nSecs, 1) * _cfg.global_decay.coeff)
     finalScore = (scoreBase + boost) * decayGlobal
     finalScore = np.nan_to_num(finalScore, nan=0.0)
 
@@ -169,7 +139,7 @@ def score(
             "trigger": trigger,
             "title": title,
             "tags": tags,
-            "thumbnailTime": round(start + 3.0, 1),  # start+3s
+            "thumbnailTime": round(start + _cfg.thumbnail.offset_sec, 1),
             "breakdown": _getBreakdown(start, end, zMatrix, weights),
         })
 
@@ -215,16 +185,16 @@ def _preprocess(features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             continue
 
         # 1. EWMA: y[t] = α·x[t] + (1-α)·y[t-1], y[0] = x[0]
-        alpha = 0.3
+        alpha = _cfg.preprocessing.ewma_alpha
         smoothed = np.empty_like(arr)
         smoothed[0] = arr[0]
         for t in range(1, n):
             smoothed[t] = alpha * arr[t] + (1.0 - alpha) * smoothed[t - 1]
 
-        # 2. Rolling Z-Score: (x - μ) / σ over 60s window (vectorized)
-        # For short recordings (≤60s) fall back to global Z-Score so
+        # 2. Rolling Z-Score: (x - μ) / σ over configurable window (vectorized)
+        # For short recordings fall back to global Z-Score so
         # clips are still detectable instead of returning all zeros.
-        window = min(60, n)
+        window = min(_cfg.preprocessing.zscore_window_sec, n)
         if n >= 3:
             if n > window:
                 rollMean = uniform_filter1d(smoothed, size=window + 1, mode="nearest")
@@ -235,16 +205,18 @@ def _preprocess(features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
                 rollMeanSq = np.full(n, np.mean(smoothed ** 2))
             rollStd = np.sqrt(np.maximum(rollMeanSq - rollMean ** 2, 0.0))
             # Avoid div-by-zero: use np.divide with where mask
+            eps = _cfg.preprocessing.zscore_eps
             with np.errstate(divide="ignore", invalid="ignore"):
                 zScore = np.divide(
                     smoothed - rollMean, rollStd,
-                    where=rollStd > 1e-10, out=np.zeros(n),
+                    where=rollStd > eps, out=np.zeros(n),
                 )
         else:
             zScore = np.zeros(n)
 
-        # 3. Median filter (5s window, vectorized)
-        medianF = median_filter(zScore, size=5, mode="nearest")
+        # 3. Median filter (vectorized)
+        median_size = _cfg.preprocessing.median_filter_size
+        medianF = median_filter(zScore, size=median_size, mode="nearest")
 
         result[name] = medianF
     return result
@@ -267,13 +239,13 @@ def _compensateLag(zMatrix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     dmSig = zMatrix[dmKeys[0]]
     auSig = zMatrix[audioKeys[0]]
     minLen = min(len(dmSig), len(auSig))
-    if minLen <= 10:
+    if minLen <= _cfg.lag_compensation.min_len:
         return zMatrix
 
     try:
         corr = sp_signal.correlate(dmSig[:minLen], auSig[:minLen])
         lag = int(np.argmax(corr) - (minLen - 1))
-        if not (0 < abs(lag) <= 5):
+        if not (0 < abs(lag) <= _cfg.lag_compensation.max_shift):
             return zMatrix
 
         log.debug(f"Danmaku→Audio lag: {lag}s — shifting dm signals")
@@ -307,14 +279,18 @@ def _detectPeaks(score: np.ndarray, k: float) -> list[tuple[float, float, float]
     n = len(score)
     candidates: set[int] = set()
 
+    wf = _cfg.detection.window_factor
+    persistence = _cfg.detection.peak_persistence_frames
+    gap = _cfg.detection.candidate_gap_sec
+
     for window in DETECTION_WINDOWS:
-        if 2 * window >= n:
+        if wf * window >= n:
             continue  # window too large for this recording
 
         # Rolling mean and std via uniform filter (boxcar window)
-        # size = 2*window for symmetric ±window neighborhood
-        localMean = uniform_filter1d(score, size=2 * window, mode="nearest")
-        localMeanSq = uniform_filter1d(score ** 2, size=2 * window, mode="nearest")
+        # size = wf*window for symmetric ±window neighborhood
+        localMean = uniform_filter1d(score, size=wf * window, mode="nearest")
+        localMeanSq = uniform_filter1d(score ** 2, size=wf * window, mode="nearest")
         localStd = np.sqrt(np.maximum(localMeanSq - localMean ** 2, 0.0))
 
         threshold = localMean + k * localStd
@@ -322,12 +298,11 @@ def _detectPeaks(score: np.ndarray, k: float) -> list[tuple[float, float, float]
         # Element-wise: is score[t] > threshold[t]?
         above = score > threshold
 
-        # Persistence: score[t], score[t+1], score[t+2] must ALL exceed threshold[t]
-        # threshold[t] varies per position, so check each shift against the same threshold
+        # Persistence: consecutive seconds must ALL exceed threshold
         persistent = above.copy()
-        persistent[:-1] &= score[1:] > threshold[:-1]  # t+1 > threshold[t]
-        persistent[:-2] &= score[2:] > threshold[:-2]  # t+2 > threshold[t]
-        persistent[-2:] = False  # can't have persistence near the end
+        for shift in range(1, persistence):
+            persistent[:-(shift)] &= score[shift:] > threshold[:-(shift)]
+        persistent[-(persistence - 1):] = False
 
         for t in np.where(persistent)[0]:
             candidates.add(int(t))
@@ -342,7 +317,7 @@ def _detectPeaks(score: np.ndarray, k: float) -> list[tuple[float, float, float]
     prev = start
     maxScore = score[start]
     for t in sortedCands[1:]:
-        if t - prev > 3:
+        if t - prev > gap:
             ranges.append((start, prev, maxScore))
             start = t
             maxScore = score[t]
@@ -361,29 +336,33 @@ def _optimizeBoundaries(
 ) -> list[tuple[float, float, float]]:
     """Semantic boundary alignment via Z-Score valley detection."""
     optimized = []
+    pad = _cfg.boundary.pad_sec
+    search = _cfg.boundary.valley_search_range
+    vw = _cfg.boundary.valley_window_radius
+
     for s, e, sc in clips:
-        newStart = max(0, s - 5)
-        newEnd = min(nSecs, e + 5)
+        newStart = max(0, s - pad)
+        newEnd = min(nSecs, e + pad)
 
         # Search for valleys (quiet moments) near boundaries.
-        # Use RMS Z-Score: a true valley sits below the local mean over ±5s.
+        # Use RMS Z-Score: a true valley sits below the local mean over ±vw.
         rms = zMatrix.get("rms")
         rmsLen = len(rms) if rms is not None else 0
         if rmsLen > 0:
-            # Find valley before peak — walk back ±10s, snap to first dip
-            for offset in range(10, 0, -1):
+            # Find valley before peak
+            for offset in range(search, 0, -1):
                 t = int(s) - offset
                 if 0 <= t < rmsLen:
-                    window = rms[max(0, t - 5):min(rmsLen, t + 5)]
+                    window = rms[max(0, t - vw):min(rmsLen, t + vw)]
                     if window.size > 0 and rms[t] < float(np.mean(window)):
                         newStart = t
                         break
 
-            # Find valley after peak — walk forward up to 10s
-            for offset in range(10):
+            # Find valley after peak
+            for offset in range(search):
                 t = int(e) + offset
                 if 0 <= t < rmsLen:
-                    window = rms[max(0, t - 5):min(rmsLen, t + 5)]
+                    window = rms[max(0, t - vw):min(rmsLen, t + vw)]
                     if window.size > 0 and rms[t] < float(np.mean(window)):
                         newEnd = t
                         break
@@ -426,12 +405,12 @@ def _qualityFilter(
         # Failure here (e.g. zero-variance scores → NaN) shouldn't kill the
         # clip — fall through to keep it; quality bounds already passed.
         clipScores = score[int(s):int(e)]
-        preStart = max(0, int(s) - 5)
+        preStart = max(0, int(s) - _cfg.t_test.pre_window_sec)
         preScores = score[preStart:int(s)]
         if len(preScores) > 2 and len(clipScores) > 2:
             try:
                 _, p = sp_stats.ttest_ind(clipScores, preScores)
-                if p > 0.05:
+                if p > _cfg.t_test.pvalue_threshold:
                     continue
             except Exception:
                 log.debug(f"t-test failed for clip {s}-{e}", exc_info=True)
@@ -456,7 +435,7 @@ def _findTrigger(
         if s >= len(z):
             continue
         peak = float(np.max(z[s:e]))
-        if peak > 2.0:
+        if peak > _cfg.detection.trigger_zscore_threshold:
             if name == "asrKeyword":
                 # Find which keyword triggered
                 asr = features.get("asrKeyword")
@@ -521,4 +500,4 @@ def _getBreakdown(
         if w > 0 and e <= len(z):
             meanZ = float(np.mean(z[s:e]))
             contribs[name] = round(w * meanZ, 4)
-    return dict(sorted(contribs.items(), key=lambda x: -abs(x[1]))[:5])
+    return dict(sorted(contribs.items(), key=lambda x: -abs(x[1]))[:_cfg.breakdown.top_n])

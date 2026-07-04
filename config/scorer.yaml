@@ -1,0 +1,114 @@
+profiles:
+  default:
+    dmDensity: 0.15
+    dmAcceleration: 0.05
+    dmEntropy: 0.05
+    dmSentiment: 0.10
+    dmUtr: 0.03
+    asrKeyword: 0.10
+    topicChange: 0.05
+    speakerChange: 0.05
+    rms: 0.10
+    mfccDist: 0.02
+    eventLaughter: 0.10
+    eventApplause: 0.05
+    eventMusic: 0.05
+    sceneChange: 0.05
+    motion: 0.05
+    faceCount: 0.00
+
+  game:
+    dmDensity: 0.20
+    dmAcceleration: 0.10
+    dmEntropy: 0.05
+    dmSentiment: 0.05
+    dmUtr: 0.03
+    asrKeyword: 0.08
+    topicChange: 0.05
+    speakerChange: 0.03
+    rms: 0.08
+    mfccDist: 0.02
+    eventLaughter: 0.10
+    eventApplause: 0.10
+    eventMusic: 0.03
+    sceneChange: 0.05
+    motion: 0.10
+    faceCount: 0.00
+
+  shopping:
+    dmDensity: 0.10
+    dmAcceleration: 0.03
+    dmEntropy: 0.03
+    dmSentiment: 0.05
+    dmUtr: 0.03
+    asrKeyword: 0.20
+    topicChange: 0.05
+    speakerChange: 0.05
+    rms: 0.05
+    mfccDist: 0.02
+    eventLaughter: 0.05
+    eventApplause: 0.05
+    eventMusic: 0.05
+    sceneChange: 0.05
+    motion: 0.03
+    faceCount: 0.00
+
+  talent:
+    dmDensity: 0.10
+    dmAcceleration: 0.05
+    dmEntropy: 0.03
+    dmSentiment: 0.15
+    dmUtr: 0.03
+    asrKeyword: 0.10
+    topicChange: 0.05
+    speakerChange: 0.10
+    rms: 0.20
+    mfccDist: 0.02
+    eventLaughter: 0.05
+    eventApplause: 0.05
+    eventMusic: 0.05
+    sceneChange: 0.03
+    motion: 0.03
+    faceCount: 0.00
+
+preprocessing:
+  ewma_alpha: 0.3
+  zscore_window_sec: 60
+  zscore_eps: 1.0e-10
+  median_filter_size: 5
+
+detection:
+  windows: [3, 10, 30]
+  nms_merge_distance: 15.0
+  min_clip_duration: 15.0
+  max_clip_duration: 90.0
+  sensitivity_default: 2.5
+  peak_persistence_frames: 3
+  candidate_gap_sec: 3.0
+  trigger_zscore_threshold: 2.0
+  window_factor: 2
+
+boundary:
+  pad_sec: 5
+  valley_search_range: 10
+  valley_window_radius: 5
+
+t_test:
+  pre_window_sec: 5
+  pvalue_threshold: 0.05
+
+global_decay:
+  coeff: 0.1
+
+thumbnail:
+  offset_sec: 3.0
+
+breakdown:
+  top_n: 5
+
+lag_compensation:
+  min_len: 10
+  max_shift: 5
+
+boost:
+  tanh_divisor: 2.0

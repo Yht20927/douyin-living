@@ -1,0 +1,11 @@
+sensitivity_default: 2.5
+min_duration_default: 15.0
+max_duration_default: 90.0
+resolution_default: "720p"
+ws_join_timeout: 3.0
+writer_join_timeout: 3.0
+queue_timeout: 0.5
+signal_pool_workers: 3
+ffmpeg_timeout_clip: 300
+ffmpeg_timeout_thumbnail: 60
+ffmpeg_timeout_burn: 300

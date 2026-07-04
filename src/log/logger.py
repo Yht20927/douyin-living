@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import logging
+import threading
 from pathlib import Path
 from loguru import logger
 from typing import Optional, Union
@@ -19,6 +20,9 @@ DEFAULT_FORMAT = (
     "<cyan>{extra[module_name]:<15}</cyan>:<cyan>{function:<18}</cyan>:<yellow>{line:<5}</yellow> "
     "- <lvl>{message}</lvl>"
 )
+
+# Protect logger reconfiguration from concurrent access
+_logLock = threading.Lock()
 
 
 class LoggerManager:
@@ -213,46 +217,47 @@ def getLogger(name: Optional[str] = None):
 
 def setLogLevel(level: str):
     """
-    动态设置日志级别
+    动态设置日志级别（线程安全）
 
     Args:
         level: 日志级别，可选值：TRACE, DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL
     """
-    # 移除所有现有的处理器
-    logger.remove()
-
-    # 重新设置图标（保持与初始化一致的 ASCII 风格）
-    logger.level("TRACE", icon="🔍")
-    logger.level("DEBUG", icon="🐛")
-    logger.level("INFO", icon="ℹ️")
-    logger.level("SUCCESS", icon="✅")
-    logger.level("WARNING", icon="⚠️")
-    logger.level("ERROR", icon="❌")
-    logger.level("CRITICAL", icon="🔥")
-
-    # 重新添加控制台输出
-    logger.add(
-        sink=sys.stdout,
-        format=LoggerManager._getFormat,
-        colorize=True,
-        level=level,
-        backtrace=True,
-        diagnose=True,
-    )
-
-    # 重新添加文件输出（如果之前有）
     global LOG_FILE_PATH
-    if 'LOG_FILE_PATH' in globals():
+    with _logLock:
+        # 移除所有现有的处理器
+        logger.remove()
+
+        # 重新设置图标（保持与初始化一致的 ASCII 风格）
+        logger.level("TRACE", icon="🔍")
+        logger.level("DEBUG", icon="🐛")
+        logger.level("INFO", icon="ℹ️")
+        logger.level("SUCCESS", icon="✅")
+        logger.level("WARNING", icon="⚠️")
+        logger.level("ERROR", icon="❌")
+        logger.level("CRITICAL", icon="🔥")
+
+        # 重新添加控制台输出
         logger.add(
-            sink=LOG_FILE_PATH,
-            format=LoggerManager._getFileFormat,
+            sink=sys.stdout,
+            format=LoggerManager._getFormat,
+            colorize=True,
             level=level,
-            rotation="10 MB",
-            retention="7 days",
-            compression="zip",
-            encoding="utf-8",
-            enqueue=True,
+            backtrace=True,
+            diagnose=True,
         )
+
+        # 重新添加文件输出（如果之前有）
+        if LOG_FILE_PATH:
+            logger.add(
+                sink=LOG_FILE_PATH,
+                format=LoggerManager._getFileFormat,
+                level=level,
+                rotation="10 MB",
+                retention="7 days",
+                compression="zip",
+                encoding="utf-8",
+                enqueue=True,
+            )
 
     logger.info(f"日志级别已设置为: {level}")
 

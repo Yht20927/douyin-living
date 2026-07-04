@@ -53,7 +53,7 @@ def clipVideo(
             continue
 
         trigger = clip.get("trigger", str(int(start)))
-        safeName = "".join(c for c in trigger if c.isalnum() or c in " _-")[:30]
+        safeName = "".join(c for c in trigger if c.isalnum() or c in " _-+")[:30]
         name = f"clip_{int(start)}s_{safeName}"
         outPath = os.path.join(outputDir, f"{name}.mp4")
 
@@ -144,6 +144,9 @@ def generateClipSrt(
     import re
     with open(srtPath, encoding="utf-8") as f:
         content = f.read()
+
+    # Normalize Windows line endings to Unix
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
 
     # Parse SRT blocks
     blocks = re.split(r"\n\n+", content.strip())

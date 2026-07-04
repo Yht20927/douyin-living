@@ -1,0 +1,14 @@
+sample_rate: 16000
+hop_length: 512
+frame_length: 2048
+n_mfcc: 13
+panns_rms_threshold: 2.0
+panns_hop_secs: 0.5
+panns_chunk_secs: 1.5
+panns_min_chunk_secs: 0.5
+panns_batch_size_gpu: 32
+panns_batch_size_cpu: 8
+min_trigger_gap_sec: 2
+event_laughter_idx: 32
+event_applause_idx: 10
+event_music_idx: 137

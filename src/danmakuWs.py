@@ -17,8 +17,10 @@ from websocket import WebSocketApp
 
 import src.protobuf.Live_pb2 as LivePb
 from src.log.logger import getLogger
+from src.config import load_settings
 
 log = getLogger(__name__)
+_cfg = load_settings().recording
 
 
 class DanmakuWs:
@@ -36,19 +38,20 @@ class DanmakuWs:
         params: dict[str, str],
         cookieStr: str,
         onDanmaku: Callable[[dict[str, Any]], None] | None = None,
-        pingInterval: float = 5.0,
-        reconnectDelay: float = 3.0,
+        pingInterval: float | None = None,
+        reconnectDelay: float | None = None,
     ):
         self._params = params
         self._cookieStr = cookieStr
         self._onDanmaku = onDanmaku
-        self._pingInterval = pingInterval
-        self._reconnectDelay = reconnectDelay
+        self._pingInterval = pingInterval if pingInterval is not None else _cfg.ws_ping_interval
+        self._reconnectDelay = reconnectDelay if reconnectDelay is not None else _cfg.ws_reconnect_delay
 
         self._ws: WebSocketApp | None = None
         self._thread: threading.Thread | None = None
         self._running = False
         self._msgCount = 0
+        self._consecutiveErrors = 0
 
     # ── public API ────────────────────────────────────────────────
 
@@ -107,8 +110,15 @@ class DanmakuWs:
                     on_close=self._onClose,
                 )
                 self._ws.run_forever(origin="https://live.douyin.com")
+                self._consecutiveErrors = 0
             except Exception as e:
-                log.warning(f"WS error, reconnecting in {self._reconnectDelay}s: {e}")
+                self._consecutiveErrors += 1
+                # Exponential backoff on repeated failures
+                delay = min(
+                    self._reconnectDelay * (2 ** (self._consecutiveErrors - 1)),
+                    _cfg.backoff_max,
+                )
+                log.warning(f"WS error, reconnecting in {delay:.1f}s (error #{self._consecutiveErrors}): {e}")
             if self._running:
                 time.sleep(self._reconnectDelay)
 
@@ -128,7 +138,11 @@ class DanmakuWs:
         t = threading.Thread(target=pingLoop, daemon=True)
         t.start()
 
-    def _onMessage(self, ws, message: bytes):
+    def _onMessage(self, ws, message):
+        # Only process binary frames; text frames are ignored.
+        if isinstance(message, str):
+            return
+
         try:
             frame = LivePb.PushFrame()
             frame.ParseFromString(message)
@@ -191,19 +205,20 @@ class DanmakuWs:
                 chat.ParseFromString(payload)
                 result["type"] = "chat"
                 result["content"] = chat.content
-                result["userName"] = chat.user.nickname
-                result["userId"] = chat.user.id
-                result["secUid"] = chat.user.sec_uid
+                # Guard against null user sub-message
+                result["userName"] = chat.user.nickname if chat.HasField("user") else ""
+                result["userId"] = chat.user.id if chat.HasField("user") else ""
+                result["secUid"] = chat.user.sec_uid if chat.HasField("user") else ""
                 return result
 
             elif method == "WebcastGiftMessage":
                 gift = LivePb.GiftMessage()
                 gift.ParseFromString(payload)
                 result["type"] = "gift"
-                result["giftName"] = gift.gift.name if gift.gift else ""
+                result["giftName"] = gift.gift.name if gift.HasField("gift") and gift.gift else ""
                 result["comboCount"] = gift.comboCount
-                result["userName"] = gift.user.nickname
-                result["toUserName"] = gift.toUser.nickname
+                result["userName"] = gift.user.nickname if gift.HasField("user") else ""
+                result["toUserName"] = gift.toUser.nickname if gift.HasField("toUser") else ""
                 return result
 
             elif method == "WebcastLikeMessage":
@@ -212,14 +227,14 @@ class DanmakuWs:
                 result["type"] = "like"
                 result["count"] = like.count
                 result["total"] = like.total
-                result["userName"] = like.user.nickname
+                result["userName"] = like.user.nickname if like.HasField("user") else ""
                 return result
 
             elif method == "WebcastMemberMessage":
                 member = LivePb.MemberMessage()
                 member.ParseFromString(payload)
                 result["type"] = "member"
-                result["userName"] = member.user.nickname
+                result["userName"] = member.user.nickname if member.HasField("user") else ""
                 result["memberCount"] = member.memberCount
                 return result
 
@@ -227,7 +242,7 @@ class DanmakuWs:
                 social = LivePb.SocialMessage()
                 social.ParseFromString(payload)
                 result["type"] = "social"
-                result["userName"] = social.user.nickname
+                result["userName"] = social.user.nickname if social.HasField("user") else ""
                 result["action"] = social.action
                 return result
 

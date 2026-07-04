@@ -16,3 +16,6 @@ logs/
 .pytest_cache/
 data/
 .*/
+.coverage
+cookie.txt
+status.txt

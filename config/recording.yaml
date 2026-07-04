@@ -1,0 +1,10 @@
+rotation_secs: 1800
+backoff_base: 2
+backoff_max: 30
+unexpected_retry_wait: 10
+max_retries: 5
+http_timeout_total: null
+http_timeout_sock_read: 30.0
+chunk_size: 65536
+ws_ping_interval: 5.0
+ws_reconnect_delay: 3.0

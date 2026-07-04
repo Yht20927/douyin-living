@@ -3,7 +3,6 @@
 
 import re
 import json
-import threading
 from typing import Any
 import httpx
 from src.log.logger import getLogger
@@ -21,6 +20,20 @@ HEADERS_PC = {
     "Referer": "https://live.douyin.com",
 }
 
+# Module-level shared client — initialised once at import time so we
+# never block the event loop inside an async function with a lock.
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the module-level shared httpx client, creating it if needed."""
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0), follow_redirects=True
+        )
+    return _client
+
 
 class RoomApi:
     """Douyin live room API client.
@@ -31,24 +44,13 @@ class RoomApi:
         detail = await RoomApi.getWebcastDetail(auth, info["userId"], info["roomId"])
     """
 
-    _client: httpx.AsyncClient | None = None
-    _clientLock = threading.Lock()
-
-    @classmethod
-    def _get_client(cls) -> httpx.AsyncClient:
-        """Lazy-init and return the shared httpx client (thread-safe)."""
-        if cls._client is None:
-            with cls._clientLock:
-                if cls._client is None:
-                    cls._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
-        return cls._client
-
-    @classmethod
-    async def close(cls):
+    @staticmethod
+    async def close():
         """Explicitly close the shared HTTP client and release connections."""
-        if cls._client is not None:
-            await cls._client.aclose()
-            cls._client = None
+        global _client
+        if _client is not None:
+            await _client.aclose()
+            _client = None
             log.debug("HTTP client closed")
 
     @staticmethod
@@ -61,7 +63,7 @@ class RoomApi:
         url = f"https://live.douyin.com/{webRid}"
         headers = dict(HEADERS_PC)
 
-        client = RoomApi._get_client()
+        client = _get_client()
 
         # Pass cookies as dict (httpx format), not as header string
         cookies = None
@@ -157,7 +159,7 @@ class RoomApi:
         elif hasattr(auth, "cookieStr") and auth.cookieStr:
             cookies = transCookies(auth.cookieStr)
 
-        client = RoomApi._get_client()
+        client = _get_client()
         resp = await client.get(url, params=p.toDict(), headers=headers, cookies=cookies, follow_redirects=True)
         resp.raise_for_status()
         log.debug(f"Webcast detail: {len(resp.content)} bytes")
@@ -178,7 +180,7 @@ class RoomApi:
         url = f"https://live.douyin.com/{webRid}"
         headers = dict(HEADERS_PC)
 
-        client = RoomApi._get_client()
+        client = _get_client()
         cookies = None
         if hasattr(auth, "cookie") and auth.cookie:
             cookies = auth.cookie
@@ -251,7 +253,7 @@ class RoomApi:
         if hasattr(auth, "cookie") and auth.cookie:
             cookies = auth.cookie
 
-        client = RoomApi._get_client()
+        client = _get_client()
         resp = await client.get(url, headers=headers, cookies=cookies, follow_redirects=True)
         resp.raise_for_status()
         return resp.json()
