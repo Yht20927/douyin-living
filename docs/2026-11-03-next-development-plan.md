@@ -737,6 +737,17 @@ src/pipeline/
 - 若某 profile 没有足够样本，暂时合并，不要制造“看似有配置、实际没数据”的假精度；
 - 自动 profile 识别（LightGBM/规则）放到 Sprint 6 之后，且必须有标注支撑。
 
+> **S5-7 执行记录（2026-11-05）**：
+>
+> - 新增 `src/profile_analysis.py`：统一缓存特征的加载与重评分入口（`loadCase`/`scoreCase`），`tune_weights.py` 改为复用它，避免两份实现漂移；新增 `profileDistance`（total-variation + cosine）与 `compareProfiles`。
+> - `compareProfiles` 对每个 profile 在所有 case 上重评分，按标注的 `profile` 字段划分 owned cases，输出逐 case P/R/F1、macro/micro 聚合、相对 `default` 的 micro/macro F1 提升、每个 case 的最佳 profile，以及 profile 两两权重距离。
+> - 支持度判定：owned cases < `minCases`（默认 2）或正样本 < `minPositives`（默认 5）→ `collect_more_or_merge`；证据足够但 micro F1 提升 < `minDelta`（默认 0.02）→ `merge_into_default`；否则 `keep`。`default` 始终保留为兜底，不会被合并。
+> - 新增 `scripts/profile_report.py`：支持重复 `--case`、`--profiles` 子集、`--k`、支持度阈值、`--json` 与 `--quiet`；只输出建议，不修改 `config/scorer.yaml`。
+> - 已确认四个 profile 加载后权重和均为 1.0。当前权重空间的 total-variation 距离：`default~game` 0.164、`default~shopping` 0.214、`default~talent` 0.150；这只说明权重不同，不证明效果更好。
+> - 新增 `tests/test_profile_analysis.py` 与 `tests/test_profile_report_cli.py`，覆盖权重距离、缓存加载、支持度/合并建议、逐 case 诊断、标签去重、未知 profile 与参数校验。
+> - 全量 **630 passed**，覆盖率 **87%**（`src/profile_analysis.py` 98%，`src/evaluation.py` 99%），`ruff check` 与 `git diff --check` 全绿。
+> - **真实标注集仍未完成**：当前没有任何 profile 拥有真实 owned cases，报告会统一建议补标注或合并；因此本次不修改 `config/scorer.yaml`，也不宣称任何 profile 已被数据验证。拿到 5~10 场标注后，先跑 `profile_report.py`，再决定保留/合并哪些 profile。
+
 **Sprint 5 完成定义**
 
 - 两阶段架构在固定标注集上产出可复现指标；

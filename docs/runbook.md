@@ -607,6 +607,35 @@ python scripts/tune_weights.py \
 | 所有候选 objective 都是 0 | 特征/短视频不足以产生片段 | 用至少 30~120 分钟真实场次；先确认 `time_table.json` 有候选 |
 | 调权结果提升很大但评估下降 | 单场过拟合或标注边界不一致 | 增加场次、固定标注规范、留出验证集 |
 
+### 10.4 Profile 对比与合并建议
+
+`profile_report.py` 用同一批标注集重评分所有 profile，检查每个 profile 是否
+有足够数据、是否真的优于 `default`：
+
+```bash
+python scripts/profile_report.py \
+  --case data/room1/time_table.json data/room1/annotations.json \
+  --case data/room2/time_table.json data/room2/annotations.json \
+  --k 5 --min-cases 2 --min-positives 5 \
+  --json /tmp/profile-report.json
+```
+
+判定规则：
+
+| 条件 | 建议 | 含义 |
+|------|------|------|
+| owned cases < `--min-cases` 或正样本 < `--min-positives` | `collect_more_or_merge` | 证据不足，先补标注，不要把 profile 当已验证 |
+| micro F1 相对 `default` 提升 < `--min-delta`（默认 0.02） | `merge_into_default` | 有数据但差异化权重没有收益 |
+| 提升 ≥ `--min-delta` | `keep` | 可以保留独立 profile |
+
+`default` 始终保留为兜底。报告同时输出每个 case 在全部 profile 下的
+P/R/F1、最佳 profile，以及 profile 两两之间的 total-variation / cosine
+距离，用于判断权重是否真的不同。脚本不会修改 `config/scorer.yaml`；合入前
+必须确认 profile 在未参与调参的场次上仍然有效。
+
+> 当前仓库没有真实人工标注，所有 profile 仍只是先验权重。`profile_report.py`
+> 的结论必须以真实标注为准，不能仅凭权重距离宣称 profile 有效。
+
 ---
 
 ## 11. 发布前 / 交付前检查

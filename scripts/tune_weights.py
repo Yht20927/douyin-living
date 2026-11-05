@@ -44,18 +44,11 @@ from src.evaluation import (  # noqa: E402
     DEFAULT_TARGETS,
     aggregateMetrics,
     computeMetrics,
-    loadAnnotations,
-    loadTimeTable,
     normalizeWeights,
     objectiveValue,
 )
+from src.profile_analysis import loadCase, scoreCase  # noqa: E402
 from src.util import FEATURE_NAMES  # noqa: E402
-
-FEATURE_FILES = {
-    "audio": "audio_features.json",
-    "text": "text_features.json",
-    "visual": "visual_features.json",
-}
 
 
 class _SilentLogger:
@@ -77,79 +70,6 @@ def patchedProfile(profile: str, weights: dict[str, float]):
             scorer.PROFILES.pop(profile, None)
         else:
             scorer.PROFILES[profile] = original
-
-
-def _loadFeatureFile(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read features {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: feature file must be a JSON object")
-    features = data.get("features")
-    if features is None:
-        return {}
-    if not isinstance(features, dict):
-        raise ValueError(f"{path}: 'features' must be an object")
-    return {
-        name: values
-        for name, values in features.items()
-        if isinstance(values, list) and values
-    }
-
-
-def loadCase(timeTablePath: str, annotationPath: str) -> dict:
-    """Load one time table, annotation file and its cached feature arrays."""
-    table = loadTimeTable(timeTablePath)
-    annotations = loadAnnotations(annotationPath)
-    roomDir = Path(timeTablePath).resolve().parent
-
-    featureSets = {
-        kind: _loadFeatureFile(roomDir / filename)
-        for kind, filename in FEATURE_FILES.items()
-    }
-    if not any(featureSets.values()):
-        raise ValueError(
-            f"{roomDir}: no non-empty feature files "
-            f"({', '.join(FEATURE_FILES.values())})"
-        )
-
-    duration = table.get("duration") or annotations.get("duration")
-    return {
-        "label": roomDir.name or Path(timeTablePath).stem,
-        "roomId": str(table.get("roomId") or annotations.get("roomId") or ""),
-        "profile": str(
-            table.get("profile") or annotations.get("profile") or "default"
-        ),
-        "audio": featureSets["audio"],
-        "text": featureSets["text"],
-        "visual": featureSets["visual"],
-        "annotations": annotations["annotations"],
-        "positiveAnnotations": annotations["positiveCount"],
-        "negativeAnnotations": annotations["negativeCount"],
-        "durationSec": float(duration) if duration else None,
-        "sensitivity": float(table.get("sensitivity", 2.5)),
-        "minDuration": float(table.get("minDuration", 15.0)),
-        "maxDuration": float(table.get("maxDuration", 90.0)),
-    }
-
-
-def scoreCase(case: dict, profile: str) -> dict:
-    """Run the scorer against one case's cached features."""
-    return scorer.score(
-        roomId=case["roomId"],
-        audioFeatures={"features": case["audio"]} if case["audio"] else None,
-        textFeatures={"features": case["text"]} if case["text"] else None,
-        visualFeatures={"features": case["visual"]} if case["visual"] else None,
-        profile=profile,
-        sensitivity=case["sensitivity"],
-        minDuration=case["minDuration"],
-        maxDuration=case["maxDuration"],
-        durationSec=case["durationSec"],
-    )
 
 
 def evaluateCandidate(

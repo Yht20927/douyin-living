@@ -323,6 +323,30 @@ python scripts/label_report.py \
 Boundary IoU≥0.5、Invalid≤0.2、Duplicate≤0.1）只是建议值，必须用真实标注
 校准；仓库当前尚未包含 5~10 场真实人工标注，不能把这些数字当对外 SLA。
 
+### Profile 支持度分析（Sprint 5 / S5-7）
+
+`scripts/profile_report.py` 用同一批标注集重评分所有 profile，回答“这个
+profile 是否真的有数据支撑”：
+
+```bash
+python scripts/profile_report.py \
+  --case data/room1/time_table.json data/room1/annotations.json \
+  --case data/room2/time_table.json data/room2/annotations.json \
+  --k 5 --min-cases 2 --min-positives 5 \
+  --json /tmp/profile-report.json
+```
+
+判定规则：
+
+- owned cases 少于 `--min-cases`（默认 2）或正样本少于 `--min-positives`
+  （默认 5）→ `collect_more_or_merge`；
+- 数据足够，但在 owned cases 上 micro F1 相对 `default` 的提升不足
+  `--min-delta`（默认 0.02）→ `merge_into_default`；
+- 否则 → `keep`；`default` 始终保留为兜底。
+
+脚本只输出建议，不修改 `config/scorer.yaml`。当前仓库没有真实标注集，所有
+profile 仍只是先验权重，不能宣称已被数据验证。
+
 ### 直播类型预设
 
 | Profile | 适用场景 | 核心权重 |
