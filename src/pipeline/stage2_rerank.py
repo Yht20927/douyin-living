@@ -31,6 +31,11 @@ import numpy as np
 from src.contracts import atomicWriteJson
 from src.log.events import logEvent
 from src.log.logger import getLogger
+from src.pipeline.boundary_optimizer import (
+    inferContentType,
+    optimizeBoundaries,
+    targetDurationRange,
+)
 from src.pipeline.stage1_recall import recallCandidates
 from src.pipeline.window_features import (
     computeWindowFeatures,
@@ -273,6 +278,10 @@ def rerankCandidates(
     minScore: float = 0.0,
     agreementZ: float = 1.0,
     semanticSignals: Iterable[str] | None = None,
+    asrSegments: list[dict] | None = None,
+    dynamicDuration: bool = True,
+    boundarySearchSec: float = 8.0,
+    platform: str = "none",
     runId: str | None = None,
 ) -> dict:
     """Rerank stage-1 candidates and return a time-table compatible result."""
@@ -325,11 +334,44 @@ def rerankCandidates(
     asrSignal = signals.get("asrKeyword")
     hasAsrSignal = bool(asrSignal is not None and asrSignal.size and np.any(asrSignal))
 
+    def _windowAt(
+        windowStart: float,
+        windowEnd: float,
+        low: float,
+        high: float,
+        kind: str,
+    ) -> dict:
+        features = computeWindowFeatures(
+            signals,
+            windowStart,
+            windowEnd,
+            weights=weights,
+            minDuration=low,
+            maxDuration=high,
+            agreementZ=agreementZ,
+        )
+        features["contentType"] = kind
+        return features
+
     for candidate in candidates:
         start = float(candidate.get("start", 0.0))
         end = float(candidate.get("end", 0.0))
+        candidateSignals = list(candidate.get("sources") or [])
+
+        contentType = (
+            inferContentType(profile, candidateSignals)
+            if dynamicDuration
+            else "default"
+        )
+        if dynamicDuration:
+            targetMin, targetMax = targetDurationRange(
+                contentType, minDuration, maxDuration, platform
+            )
+        else:
+            targetMin, targetMax = minDuration, maxDuration
+
         refinedStart, refinedEnd, adjusted = _selectWindow(
-            recallCurve, start, end, minDuration, maxDuration
+            recallCurve, start, end, targetMin, targetMax
         )
         if refinedEnd - refinedStart < 1.0:
             dropped.append({
@@ -341,15 +383,103 @@ def rerankCandidates(
             })
             continue
 
-        window = computeWindowFeatures(
-            signals,
-            refinedStart,
-            refinedEnd,
-            weights=weights,
-            minDuration=minDuration,
-            maxDuration=maxDuration,
-            agreementZ=agreementZ,
+        window = _windowAt(
+            refinedStart, refinedEnd, targetMin, targetMax, contentType
         )
+
+        # Stage-1 sources are a hint; once the provisional window is known,
+        # active in-window signals can reveal a more specific content type
+        # (e.g. a generic `rms` candidate that is actually a music segment).
+        if dynamicDuration:
+            refinedType = inferContentType(
+                profile, candidateSignals + list(window["activeSignals"])
+            )
+            if refinedType != contentType:
+                contentType = refinedType
+                targetMin, targetMax = targetDurationRange(
+                    contentType, minDuration, maxDuration, platform
+                )
+                newStart, newEnd, durationAdjusted = _selectWindow(
+                    recallCurve, refinedStart, refinedEnd, targetMin, targetMax
+                )
+                if newEnd - newStart >= 1.0:
+                    adjusted = adjusted or durationAdjusted
+                    refinedStart, refinedEnd = newStart, newEnd
+                    window = _windowAt(
+                        refinedStart, refinedEnd,
+                        targetMin, targetMax, contentType,
+                    )
+
+        boundaryInfo = {
+            "start": refinedStart,
+            "end": refinedEnd,
+            "duration": round(refinedEnd - refinedStart, 2),
+            "changed": False,
+            "startSource": "original",
+            "endSource": "original",
+            "boundaryReasons": [],
+            "contentType": contentType,
+            "targetDuration": [float(targetMin), float(targetMax)],
+        }
+        boundaryOriginalStart = refinedStart
+        boundaryOriginalEnd = refinedEnd
+        durationAdjusted = adjusted
+        boundaryShifted = False
+        if boundarySearchSec > 0:
+            beforeStart, beforeEnd = refinedStart, refinedEnd
+            boundaryInfo = optimizeBoundaries(
+                refinedStart,
+                refinedEnd,
+                signals,
+                recallCurve,
+                asrSegments=asrSegments,
+                targetMin=targetMin,
+                targetMax=targetMax,
+                searchSec=boundarySearchSec,
+                contentType=contentType,
+                platform=platform,
+            )
+            if boundaryInfo["changed"]:
+                duration = boundaryInfo["duration"]
+                if duration < targetMin - 0.5 or duration > targetMax + 0.5:
+                    fallbackStart, fallbackEnd, _ = _selectWindow(
+                        recallCurve,
+                        boundaryInfo["start"],
+                        boundaryInfo["end"],
+                        targetMin,
+                        targetMax,
+                    )
+                    boundaryInfo["start"] = round(fallbackStart, 2)
+                    boundaryInfo["end"] = round(fallbackEnd, 2)
+                    boundaryInfo["duration"] = round(fallbackEnd - fallbackStart, 2)
+                    boundaryInfo["changed"] = (
+                        abs(fallbackStart - beforeStart) >= 0.5
+                        or abs(fallbackEnd - beforeEnd) >= 0.5
+                    )
+                    boundaryInfo["fallback"] = True
+                    # The fallback is a duration re-fit, not a semantic
+                    # boundary snap: do not attribute it to ASR/scene edges.
+                    boundaryInfo["startSource"] = "original"
+                    boundaryInfo["endSource"] = "original"
+                    boundaryInfo["boundaryReasons"] = []
+                    if boundaryInfo["changed"]:
+                        refinedStart = boundaryInfo["start"]
+                        refinedEnd = boundaryInfo["end"]
+                        window = _windowAt(
+                            refinedStart, refinedEnd,
+                            targetMin, targetMax, contentType,
+                        )
+                        durationAdjusted = True
+                else:
+                    refinedStart = boundaryInfo["start"]
+                    refinedEnd = boundaryInfo["end"]
+                    window = _windowAt(
+                        refinedStart, refinedEnd,
+                        targetMin, targetMax, contentType,
+                    )
+                    boundaryShifted = True
+        adjusted = durationAdjusted or boundaryShifted
+
         effectiveWeights = {
             name: weight
             for name, weight in weights.items()
@@ -370,17 +500,34 @@ def rerankCandidates(
         sources = list(dict.fromkeys(
             list(candidate.get("sources") or []) + list(window["activeSignals"])
         ))
-        reasons = sources[:5]
-        trigger = "+".join(reasons) if reasons else "unknown"
+        boundaryReasons = list(boundaryInfo.get("boundaryReasons") or [])
+        reasons = list(dict.fromkeys(sources + boundaryReasons))
+        trigger = "+".join(sources[:5]) if sources else "unknown"
         risks = _risksFor(window, adjusted, hasAsrSignal=hasAsrSignal)
+        if boundaryInfo.get("fallback") and boundaryInfo.get("changed"):
+            risks.append("boundary_fallback")
 
-        if adjusted and (refinedStart != start or refinedEnd != end):
+        if durationAdjusted and (refinedStart != start or refinedEnd != end):
             adjustments.append({
                 "start": window["start"],
                 "end": window["end"],
                 "originalStart": round(start, 2),
                 "originalEnd": round(end, 2),
                 "reason": "stage2_duration_fit",
+                "contentType": contentType,
+                "targetDuration": [round(targetMin, 2), round(targetMax, 2)],
+            })
+
+        if boundaryShifted:
+            adjustments.append({
+                "start": window["start"],
+                "end": window["end"],
+                "originalStart": round(boundaryOriginalStart, 2),
+                "originalEnd": round(boundaryOriginalEnd, 2),
+                "reason": "boundary_optimized",
+                "boundaryReasons": boundaryReasons,
+                "startSource": boundaryInfo.get("startSource"),
+                "endSource": boundaryInfo.get("endSource"),
             })
 
         ranked.append({
@@ -389,6 +536,13 @@ def rerankCandidates(
             "duration": window["duration"],
             "score": score,
             "confidence": confidence,
+            "contentType": contentType,
+            "targetDuration": [round(targetMin, 2), round(targetMax, 2)],
+            "boundary": {
+                "startSource": boundaryInfo.get("startSource", "original"),
+                "endSource": boundaryInfo.get("endSource", "original"),
+                "reasons": boundaryReasons,
+            },
             "trigger": trigger,
             "title": _titleFor(trigger, window["start"]),
             "tags": _tagsFor(trigger),
@@ -421,6 +575,14 @@ def rerankCandidates(
     for index, clip in enumerate(ranked, start=1):
         clip["id"] = index
 
+    contentTypeCounts: dict[str, int] = {}
+    boundaryAdjusted = 0
+    for clip in ranked:
+        kind = clip.get("contentType", "default")
+        contentTypeCounts[kind] = contentTypeCounts.get(kind, 0) + 1
+        if clip.get("boundary", {}).get("reasons"):
+            boundaryAdjusted += 1
+
     elapsedMs = int((time.perf_counter() - startedAt) * 1000)
     log.info(
         f"Stage 2 rerank: {len(ranked)}/{len(candidates)} candidates kept "
@@ -437,6 +599,8 @@ def rerankCandidates(
         outputCount=len(ranked),
         droppedCount=len(dropped),
         topK=topK,
+        boundaryAdjusted=boundaryAdjusted,
+        contentTypes=contentTypeCounts,
     )
     return {
         "clips": ranked,
@@ -448,6 +612,8 @@ def rerankCandidates(
             "outputCount": len(ranked),
             "droppedCount": len(dropped),
             "topK": topK,
+            "boundaryAdjusted": boundaryAdjusted,
+            "contentTypes": contentTypeCounts,
             "elapsedMs": elapsedMs,
         },
     }
@@ -492,6 +658,10 @@ def twoStageScore(
     recallThreshold: float = 0.8,
     windowSeconds: float = 30.0,
     minScore: float = 0.0,
+    asrSegments: list[dict] | None = None,
+    dynamicDuration: bool = True,
+    boundarySearchSec: float = 8.0,
+    platform: str = "none",
     outputPath: str | None = None,
     scoresPath: str | None = None,
     candidatesPath: str | None = None,
@@ -529,6 +699,10 @@ def twoStageScore(
         maxDuration=maxDuration,
         topK=topK,
         minScore=minScore,
+        asrSegments=asrSegments,
+        dynamicDuration=dynamicDuration,
+        boundarySearchSec=boundarySearchSec,
+        platform=platform,
         runId=runId,
     )
 
@@ -540,6 +714,11 @@ def twoStageScore(
         "pipeline": "two_stage",
         "minDuration": minDuration,
         "maxDuration": maxDuration,
+        "durationPolicy": {
+            "dynamic": dynamicDuration,
+            "boundarySearchSec": boundarySearchSec,
+            "platform": platform,
+        },
         "clips": rerank.get("clips") or [],
         "dropped": rerank.get("dropped") or [],
         "adjustments": rerank.get("adjustments") or [],

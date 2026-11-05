@@ -978,6 +978,18 @@ class Controller:
             )
             if artifactStatus.get(stepName) == "ok"
         ]
+        asrSegments: list[dict] = []
+        if useTwoStage:
+            # Sentence boundaries are only needed by the two-stage boundary
+            # optimizer; the legacy scorer never read the raw ASR document.
+            asrDoc = self._loadJsonDict(asrPath) or {}
+            if isinstance(asrDoc.get("segments"), list):
+                asrSegments = [
+                    segment for segment in asrDoc["segments"]
+                    if isinstance(segment, dict)
+                ]
+            if os.path.exists(asrPath):
+                scoringInputs.append(asrPath)
         scoreParams = {
             "profile": self.profile,
             "sensitivity": self.sensitivity,
@@ -996,6 +1008,9 @@ class Controller:
                 "recallThreshold": _cfg.two_stage_recall_threshold,
                 "windowSeconds": _cfg.two_stage_window_sec,
                 "minScore": _cfg.two_stage_min_score,
+                "dynamicDuration": _cfg.two_stage_dynamic_duration,
+                "boundarySearchSec": _cfg.two_stage_boundary_search_sec,
+                "platform": _cfg.two_stage_platform,
             }
 
         def _scoreOutputs(pipeline: str = "") -> list[str]:
@@ -1064,6 +1079,10 @@ class Controller:
                         recallThreshold=_cfg.two_stage_recall_threshold,
                         windowSeconds=_cfg.two_stage_window_sec,
                         minScore=_cfg.two_stage_min_score,
+                        asrSegments=asrSegments,
+                        dynamicDuration=_cfg.two_stage_dynamic_duration,
+                        boundarySearchSec=_cfg.two_stage_boundary_search_sec,
+                        platform=_cfg.two_stage_platform,
                         outputPath=timeTablePath,
                         scoresPath=scoresPath,
                         candidatesPath=candidatesPath,

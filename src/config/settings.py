@@ -387,6 +387,11 @@ class PipelineSettings(_YamlSectionSettings):
     two_stage_recall_threshold: float = Field(default=0.8, ge=0.0)
     two_stage_window_sec: float = Field(default=30.0, gt=0.0)
     two_stage_min_score: float = Field(default=0.0, ge=0.0)
+    two_stage_dynamic_duration: bool = True
+    two_stage_boundary_search_sec: float = Field(default=8.0, ge=0.0)
+    two_stage_platform: str = Field(
+        default="none", pattern=r"^(none|douyin|bilibili|xiaohongshu)$"
+    )
 
     @model_validator(mode="after")
     def _validateDurations(self):

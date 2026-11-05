@@ -625,6 +625,15 @@ src/pipeline/
   - 才艺/音乐：45~120s。
 - 输出 `confidence`、`reason[]`、`risks[]`、`dropReasons[]`。
 
+> **S5-2 执行记录（2026-11-05）**：
+>
+> - 新增 `src/pipeline/boundary_optimizer.py`：根据 profile 与窗口内活跃信号推断 `contentType`；内容时长预设为 funny 12~35s、shopping 20~60s、interaction 30~90s、talent 45~120s、game 15~60s、default 15~90s，用户 min/max 保持硬边界；平台限制（douyin 15~60s、bilibili 60~180s、xiaohongshu 15~60s）仅在区间有交集时作为软约束。
+> - 边界候选来自 ASR 句子 start/end、RMS 局部极小值、场景切点、融合分数曲线谷值和原始边界；按 `ASR > silence > sceneChange > scoreValley > original` 的语义权重与距离/时长/分数保留代价做起点/终点联合搜索。平坦区域不会伪造成静音或谷值候选；无有效候选时保持原窗口。
+> - `stage2_rerank.py` 接入动态时长与边界优化：先按候选来源推断内容类型，再用窗口内活跃信号二次修正；输出新增 `contentType/targetDuration/boundary.startSource/boundary.endSource/boundary.reasons`，边界移动记录 `boundary_optimized` adjustment，越界回退时按时长重拟合处理并追加 `boundary_fallback` 风险标记，阶段统计新增 `boundaryAdjusted/contentTypes`。
+> - 配置新增 `two_stage_dynamic_duration`（默认 true）、`two_stage_boundary_search_sec`（默认 8）、`two_stage_platform`（默认 none），支持 `PIPELINE_TWO_STAGE_*` 环境变量；三项均进入 scorer 缓存 key。controller 在两阶段模式下读取 ASR `segments` 传入 `twoStageScore()`，并把 ASR 文件加入评分输入，ASR 句界变化可使时间表缓存失效。
+> - 新增 `tests/test_boundary_optimizer.py`（内容类型、动态时长、平台软限制、ASR/静音/场景/谷值边界、时长惩罚、确定性与关闭开关），扩展 stage2/config/controller 测试（动态时长、二次类型修正、ASR 边界调整、平台限制、ASR 参数传递、缓存 key）。全量 **475 passed**，覆盖率 **86%**，`ruff check src tests` 与 `git diff --check` 全绿。
+> - 仍待 Sprint 5 后续完成：固定标注集上的 Boundary IoU/Precision@K 指标、内容类型与平台预设的数据校准、文本特征升级、视觉单次解码。
+
 ### S5-3 文本特征升级
 
 - 增加 `dmUniqueUsers` 权重（真实热度比纯消息量更可靠）；

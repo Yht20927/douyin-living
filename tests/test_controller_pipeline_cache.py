@@ -42,6 +42,7 @@ def pipelineEnv(tmp_path, monkeypatch):
         "visual_signal": 0,
         "score": 0,
         "two_stage": 0,
+        "two_stage_last": None,
         "clip": 0,
         "srt": 0,
         "thumbnail": 0,
@@ -149,6 +150,7 @@ def pipelineEnv(tmp_path, monkeypatch):
 
     def fakeTwoStage(**kwargs):
         calls["two_stage"] += 1
+        calls["two_stage_last"] = kwargs
         clips = [
             {
                 "id": 1,
@@ -390,6 +392,14 @@ class TestPipelineCache:
         assert calls["two_stage"] == 1
         assert (outputDir / "recall_candidates.json").exists()
 
+        twoStageKwargs = calls["two_stage_last"]
+        assert twoStageKwargs["asrSegments"] == [
+            {"start": 0.0, "end": 5.0, "text": "hello"}
+        ]
+        assert twoStageKwargs["dynamicDuration"] is True
+        assert twoStageKwargs["boundarySearchSec"] == 8.0
+        assert twoStageKwargs["platform"] == "none"
+
         status = loadStatus(outputDir)
         step = status["steps"]["7_scorer"]
         assert step["meta"]["pipeline"] == "two_stage"
@@ -408,6 +418,34 @@ class TestPipelineCache:
         runPipeline(outputDir, twoStage=True)
         assert calls["two_stage"] == 1
         assert loadStatus(outputDir)["steps"]["7_scorer"]["status"] == "skipped"
+
+    def test_two_stage_scoring_records_asr_as_cache_input(self, pipelineEnv):
+        outputDir = pipelineEnv["outputDir"]
+        calls = pipelineEnv["calls"]
+
+        runPipeline(outputDir, twoStage=True)
+        assert calls["two_stage"] == 1
+
+        meta = json.loads(
+            (outputDir / "time_table.json.meta.json").read_text(encoding="utf-8")
+        )
+        asrPath = str(outputDir / "room_merged_asr.json")
+        assert asrPath in meta["sourceHashes"]
+        assert meta["params"]["scoring"] == "two_stage"
+
+    def test_two_stage_cache_key_tracks_boundary_settings(
+        self, pipelineEnv, monkeypatch
+    ):
+        outputDir = pipelineEnv["outputDir"]
+        calls = pipelineEnv["calls"]
+
+        runPipeline(outputDir, twoStage=True)
+        assert calls["two_stage"] == 1
+
+        monkeypatch.setattr("src.controller._cfg.two_stage_boundary_search_sec", 4.0)
+        runPipeline(outputDir, twoStage=True)
+        assert calls["two_stage"] == 2
+        assert calls["two_stage_last"]["boundarySearchSec"] == 4.0
 
     def test_failed_asr_is_retried(self, pipelineEnv):
         outputDir = pipelineEnv["outputDir"]

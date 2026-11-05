@@ -173,13 +173,25 @@ Z-Score 标准化 → 加权融合 → 时间衰减 → 突变奖励
 阶段 B（窗口级精排）
   peak / mean / area / 前后对比 / 多信号一致性 / novelty / durationFit
   + 语义事件 bonus → topK + 重叠抑制
-  → confidence / reasons / risks / windowFeatures → time_table.json
+  + 内容类型动态时长 + 边界联合优化
+    （ASR 句界 / RMS 静音 / 场景切点 / 分数谷值）
+  → confidence / reasons / risks / boundary → time_table.json
 ```
 
 默认 `two_stage_enabled=false`，旧评分路径保留，便于用固定标注集做 A/B。
 两阶段参数：`two_stage_recall_per_hour`、`two_stage_top_k`、`two_stage_min_gap_sec`、
 `two_stage_recall_threshold`、`two_stage_window_sec`、`two_stage_min_score`，
 均可在 `config/pipeline.yaml` 或 `PIPELINE_TWO_STAGE_*` 环境变量中配置。
+
+S5-2 起阶段 B 还会根据 profile 与窗口内信号推断 `contentType`，并按内容类型收窄
+目标时长：funny 12~35s、shopping 20~60s、interaction 30~90s、talent 45~120s、
+game 15~60s、default 15~90s；用户 `--min-duration/--max-duration` 始终是硬边界。
+可选的平台软限制由 `two_stage_platform`（`none/douyin/bilibili/xiaohongshu`）控制，
+仅当平台区间与内容/用户区间有交集时生效。边界搜索半径由
+`two_stage_boundary_search_sec` 控制，输出中的每个切片包含
+`contentType/targetDuration/boundary.startSource/boundary.endSource/boundary.reasons`，
+被移动的边界会额外记录 `boundary_optimized` adjustment。
+`dynamicDuration`、`boundarySearchSec`、`platform` 也进入 scorer 缓存 key。
 
 ### 直播类型预设
 

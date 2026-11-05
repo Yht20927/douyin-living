@@ -23,3 +23,6 @@ two_stage_min_gap_sec: 12.0
 two_stage_recall_threshold: 0.8
 two_stage_window_sec: 30.0
 two_stage_min_score: 0.0
+two_stage_dynamic_duration: true
+two_stage_boundary_search_sec: 8.0
+two_stage_platform: "none"

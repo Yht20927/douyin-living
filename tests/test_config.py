@@ -119,6 +119,9 @@ class TestPipelineSettingsDefaults:
         assert s.two_stage_recall_threshold == 0.8
         assert s.two_stage_window_sec == 30.0
         assert s.two_stage_min_score == 0.0
+        assert s.two_stage_dynamic_duration is True
+        assert s.two_stage_boundary_search_sec == 8.0
+        assert s.two_stage_platform == "none"
 
 
 class TestEnvironmentOverrides:
@@ -158,6 +161,9 @@ class TestEnvironmentOverrides:
         monkeypatch.setenv("PIPELINE_TWO_STAGE_RECALL_THRESHOLD", "1.1")
         monkeypatch.setenv("PIPELINE_TWO_STAGE_WINDOW_SEC", "25")
         monkeypatch.setenv("PIPELINE_TWO_STAGE_MIN_SCORE", "0.15")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_DYNAMIC_DURATION", "false")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_BOUNDARY_SEARCH_SEC", "5.5")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_PLATFORM", "douyin")
         settings = PipelineSettings()
         assert settings.two_stage_enabled is True
         assert settings.two_stage_recall_per_hour == 45.0
@@ -166,6 +172,9 @@ class TestEnvironmentOverrides:
         assert settings.two_stage_recall_threshold == 1.1
         assert settings.two_stage_window_sec == 25.0
         assert settings.two_stage_min_score == 0.15
+        assert settings.two_stage_dynamic_duration is False
+        assert settings.two_stage_boundary_search_sec == 5.5
+        assert settings.two_stage_platform == "douyin"
 
     def test_explicit_init_still_wins(self, monkeypatch):
         monkeypatch.setenv("AUDIO_PANNS_RMS_THRESHOLD", "9.9")

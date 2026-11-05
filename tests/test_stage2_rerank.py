@@ -58,6 +58,11 @@ class TestTwoStageContract:
 
         savedTable = json.loads(timeTable.read_text(encoding="utf-8"))
         assert savedTable["clips"] == result["clips"]
+        assert savedTable["durationPolicy"] == {
+            "dynamic": True,
+            "boundarySearchSec": 8.0,
+            "platform": "none",
+        }
         savedScores = json.loads(scores.read_text(encoding="utf-8"))
         assert len(savedScores["scores"]) == 90
         assert savedScores["pipeline"] == "two_stage"
@@ -197,3 +202,117 @@ class TestRerankRanking:
 
         with pytest.raises(ValueError, match="minDuration"):
             rerankCandidates([], minDuration=90.0, maxDuration=15.0)
+
+
+class TestDynamicDurationAndBoundaries:
+    def _rank(self, candidates, n, **overrides):
+        rms = np.zeros(n)
+        for candidate in candidates:
+            start = int(candidate["start"])
+            end = int(candidate["end"])
+            rms[start:end] = 5.0
+        audioFeatures = {"features": {
+            "rms": rms.tolist(),
+            "eventLaughter": overrides.pop("eventLaughter", np.zeros(n)).tolist(),
+            "eventMusic": overrides.pop("eventMusic", np.zeros(n)).tolist(),
+        }}
+        textFeatures = {"features": {
+            "asrKeyword": overrides.pop("asrKeyword", np.zeros(n)).tolist(),
+        }}
+        kwargs = {
+            "durationSec": n,
+            "audioFeatures": audioFeatures,
+            "textFeatures": textFeatures,
+            "minDuration": 15.0,
+            "maxDuration": 120.0,
+            "topK": 10,
+            **overrides,
+        }
+        return rerankCandidates(candidates, **kwargs)
+
+    def test_content_type_selects_dynamic_duration(self):
+        n = 300
+        eventLaughter = np.zeros(n)
+        eventLaughter[95:125] = 1.0
+        eventMusic = np.zeros(n)
+        eventMusic[195:225] = 1.0
+        candidates = [
+            {"start": 90.0, "end": 120.0, "score": 1.0, "sources": ["eventLaughter"]},
+            {"start": 195.0, "end": 225.0, "score": 1.0, "sources": ["eventMusic"]},
+        ]
+        result = self._rank(
+            candidates,
+            n,
+            eventLaughter=eventLaughter,
+            eventMusic=eventMusic,
+            dynamicDuration=True,
+            boundarySearchSec=0.0,
+        )
+
+        funny = next(c for c in result["clips"] if c["start"] < 150)
+        talent = next(c for c in result["clips"] if c["start"] >= 150)
+        assert funny["contentType"] == "funny"
+        assert funny["targetDuration"] == [15.0, 35.0]
+        assert talent["contentType"] == "talent"
+        assert talent["targetDuration"] == [45.0, 120.0]
+        assert talent["duration"] >= 45.0
+        assert result["stats"]["contentTypes"] == {"funny": 1, "talent": 1}
+
+    def test_secondary_signal_refines_default_to_funny(self):
+        n = 200
+        eventLaughter = np.zeros(n)
+        eventLaughter[55:70] = 1.0
+        result = self._rank(
+            [{"start": 50.0, "end": 80.0, "score": 1.0, "sources": ["rms"]}],
+            n,
+            eventLaughter=eventLaughter,
+            dynamicDuration=True,
+            boundarySearchSec=0.0,
+        )
+        clip = result["clips"][0]
+        assert clip["contentType"] == "funny"
+        assert clip["targetDuration"] == [15.0, 35.0]
+
+    def test_asr_sentence_boundary_is_applied_and_recorded(self):
+        n = 200
+        asrKeyword = np.zeros(n)
+        asrKeyword[50:90] = 1.0
+        result = self._rank(
+            [{"start": 50.0, "end": 88.0, "score": 1.0, "sources": ["rms"]}],
+            n,
+            asrKeyword=asrKeyword,
+            asrSegments=[{"start": 50.0, "end": 90.0}],
+            minDuration=30.0,
+            maxDuration=60.0,
+            dynamicDuration=False,
+            boundarySearchSec=10.0,
+        )
+        clip = result["clips"][0]
+        assert clip["end"] == 90.0
+        assert clip["boundary"]["endSource"] == "asrSentence"
+        assert "boundary_asrSentence" in clip["boundary"]["reasons"]
+        assert any(
+            item["reason"] == "boundary_optimized"
+            and (
+                item["startSource"] == "asrSentence"
+                or item["endSource"] == "asrSentence"
+            )
+            for item in result["adjustments"]
+        )
+
+    def test_platform_soft_limit_is_applied_to_talent(self):
+        n = 300
+        eventMusic = np.zeros(n)
+        eventMusic[100:160] = 1.0
+        result = self._rank(
+            [{"start": 100.0, "end": 160.0, "score": 1.0, "sources": ["eventMusic"]}],
+            n,
+            eventMusic=eventMusic,
+            dynamicDuration=True,
+            boundarySearchSec=0.0,
+            platform="douyin",
+        )
+        clip = result["clips"][0]
+        assert clip["contentType"] == "talent"
+        assert clip["targetDuration"] == [45.0, 60.0]
+        assert 45.0 <= clip["duration"] <= 60.0
