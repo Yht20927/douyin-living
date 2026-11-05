@@ -1,7 +1,7 @@
 # 运行手册（Runbook）
 
-> 适用版本：Sprint 4（2026-11-05）
-> 覆盖范围：录制、弹幕、AI 切片、缓存恢复、日志与事件排查
+> 适用版本：Sprint 5（2026-11-05）
+> 覆盖范围：录制、弹幕、AI 切片、缓存恢复、评估/调权/标注、日志与事件排查
 
 本手册面向实际运行和排障。先看“快速定位”，再按故障类型跳转。所有命令默认在项目根目录执行：
 
@@ -512,7 +512,104 @@ jq -r 'select(.event == "pipeline.step")
 
 ---
 
-## 10. 发布前 / 交付前检查
+## 10. 评估、调权与标注
+
+### 10.1 评估已有切片
+
+前置条件：
+
+- `data/{roomId}/time_table.json` 已生成；
+- 人工标注文件符合 `docs/annotation-guide.md`，至少包含一个正样本
+  （`worthClipping=true` 且 `quality>=3`）。
+
+```bash
+# 单场，两个 K
+python scripts/evaluate.py \
+  --time-table "$DATA/time_table.json" \
+  --annotations "$DATA/annotations.json" \
+  --k 5 --k 10 --json "$DATA/eval.json"
+
+# 多场聚合；任一 macro/micro 目标未达标时返回 1
+python scripts/evaluate.py \
+  --case data/room1/time_table.json data/room1/annotations.json \
+  --case data/room2/time_table.json data/room2/annotations.json \
+  --k 5 --fail-on-target
+
+# 先用宽松匹配看召回，再用严格匹配看边界
+python scripts/evaluate.py ... --match-iou 0.0
+python scripts/evaluate.py ... --match-iou 0.3
+```
+
+读结果时注意：
+
+- `precisionAtK` 分母是 `min(K, 实际片段数)`；跨场比较优先看
+  `precisionAtKStrict` 或 micro 聚合；
+- `recallAtK` 分母始终是全部正样本，K 越小召回越低是正常的；
+- `boundaryIou` / `editingCostSec` 只统计匹配成功的片段；没有匹配时为 `—`；
+- `invalidRate` 高说明前 K 里有大量片段没有对应高光；
+- `duplicateRate` 高说明 NMS/去重不足；
+- `negativeHitRate` 高说明系统仍在切“容易误判但不应切”的内容。
+
+初始目标只是建议值。第一次真实标注跑完后，把实测 macro/micro 指标记录到
+`docs/2026-11-03-next-development-plan.md` 或版本发布说明，再调整目标。
+
+### 10.2 生成标注页
+
+```bash
+python scripts/label_report.py \
+  --time-table "$DATA/time_table.json" \
+  --top 10 \
+  --output "$DATA/label_report"
+```
+
+- 浏览器打开 `label_report/index.html`；
+- 缩略图内嵌在 HTML 中，上下文视频在 `label_report/media/`；
+- 未判断的候选不会导出；页面底部可补 Top-K 之外的正/负样本；
+- `--annotations` 可传入已有标注，自动预填匹配候选；
+- 没有 ffmpeg 时加 `--no-thumbnails --no-context`，仍可生成纯表单页。
+
+标注完成后把导出的 JSON 放到 `data/{roomId}/annotations.json`，再跑
+`evaluate.py`。详细规范见 `docs/annotation-guide.md`。
+
+### 10.3 调权
+
+`tune_weights.py` 直接读取 `audio_features.json` / `text_features.json` /
+`visual_features.json`，临时替换 `src.scorer.PROFILES` 中的权重后调用
+`score()`，**不会重跑 ASR/视觉模型**。
+
+```bash
+# 随机搜索
+python scripts/tune_weights.py \
+  --case "$DATA/time_table.json" "$DATA/annotations.json" \
+  --profile default --k 5 --objective f1 --aggregate micro \
+  --strategy random --iterations 200 --seed 42 \
+  --output-yaml /tmp/default.tuned.yaml --json /tmp/tune-default.json
+
+# 坐标式网格搜索（适合特征少、想保守调整时）
+python scripts/tune_weights.py \
+  --case ... --strategy grid --rounds 2 \
+  --grid-multipliers 0,0.5,1.5,2
+```
+
+输出中的 YAML 是 `config/scorer.yaml` 的片段，不会自动写入配置。合入前：
+
+1. 确认权重和接近 1（脚本已归一化，四舍五入可能有 1e-6 误差）；
+2. 用同一标注集重跑 `evaluate.py`，确认提升不是单场过拟合；
+3. 至少留一场未参与调参的直播做验证；
+4. 记录 `objective`、`baseline`、`best`、`evaluated` 和随机种子。
+
+常见问题：
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `no non-empty feature files` | 目录里没有三路特征产物 | 先跑完整 `--clip-only` 或至少 signal 步骤 |
+| `annotations contain no positive highlights` | 标注全是负样本或质量都 <3 | 检查 `worthClipping/quality`，或调低 `--min-quality` |
+| 所有候选 objective 都是 0 | 特征/短视频不足以产生片段 | 用至少 30~120 分钟真实场次；先确认 `time_table.json` 有候选 |
+| 调权结果提升很大但评估下降 | 单场过拟合或标注边界不一致 | 增加场次、固定标注规范、留出验证集 |
+
+---
+
+## 11. 发布前 / 交付前检查
 
 ```bash
 # 1. 环境与模型
@@ -528,6 +625,12 @@ python -m src.controller "$ROOM" --clip-only --dry-run
 # 4. 核对状态与事件
 jq '.failureSummary, .cacheStats' "$DATA/pipeline_status.json"
 jq -r 'select(.event == "pipeline.finish") | [.ts, .status, .failures] | @tsv' logs/events.jsonl | tail -1
+
+# 5. 有真实标注时跑评估（没有标注则跳过并注明）
+python scripts/evaluate.py \
+  --time-table "$DATA/time_table.json" \
+  --annotations "$DATA/annotations.json" \
+  --k 5 --k 10 --json "$DATA/eval.json"
 ```
 
 交付时应满足：
@@ -536,4 +639,6 @@ jq -r 'select(.event == "pipeline.finish") | [.ts, .status, .failures] | @tsv' l
 - 测试全绿，覆盖率不低于门禁；
 - `pipeline_status.json` 中没有 `failed/invalid` 步骤（`empty` 需结合业务确认）；
 - 最近一次 `pipeline.finish` 的 `status` 为 `ok`；
-- 已确认 Cookie 有效期、磁盘余量和模型缓存。
+- 已确认 Cookie 有效期、磁盘余量和模型缓存；
+- 有真实标注时，评估指标与初始目标的差异已记录，没有标注时明确说明
+  “尚未建立真实基线”。

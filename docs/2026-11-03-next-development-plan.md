@@ -717,6 +717,19 @@ src/pipeline/
 
 **注意**：上表目标是建议值，第一次运行后必须以真实基线为准，不要在没有基线时对外承诺。
 
+> **S5-6 执行记录（2026-11-05）**：
+>
+> - 新增 `src/evaluation.py`：标注 JSON 校验/归一化（对象或裸列表、严格布尔解析、重复 id/边界/质量/有限数检查）、时间 IoU、按 score/start 排序、系统片段与正样本的一对一最大基数匹配（Kuhn 增广路，避免重复片段重复计分）、P@K/R@K/F1、Boundary IoU、Editing Cost、Invalid/Duplicate/Negative Hit Rate。
+> - P@K 分母按 `min(K, 实际片段数)`，另输出 `precisionAtKStrict`（分母固定 K）；R@K 分母为全部正样本。重复片段默认按时间 IoU ≥ 0.5 判定，负样本命中按任意时间重叠判定。
+> - 支持逐 case 指标与 macro/micro 聚合；目标检查区分“越大越好”和“越小越好”，无数据时返回 `pass=null`。目标默认值来自计划表，明确标记为待真实基线校准。
+> - 新增 `scripts/evaluate.py`：支持单场 `--time-table/--annotations`、重复 `--case`、重复 `--k`、`--match-iou`、`--duplicate-iou`、`--min-quality`、自定义 `--targets`、JSON 输出与 `--fail-on-target` 退出码。
+> - 新增 `scripts/tune_weights.py`：读取缓存的三路特征与标注，在内存中临时替换 `src.scorer.PROFILES[profile]` 后调用 `score()`，支持 random 搜索与坐标式 grid 搜索，输出 baseline/best 指标、最佳权重 YAML 与完整 JSON；不重跑 ASR/视觉模型，不自动改 `config/scorer.yaml`。
+> - 新增 `scripts/label_report.py`：按排名生成 Top-K 候选缩略图、可选上下文视频、自包含 HTML 审核页与 `annotations.template.json`；页面支持“值得切/不值得切/质量/类型/备注”、Top-K 之外的自定义标注、浏览器导出 JSON，并可用已有标注预填。
+> - 新增 `docs/annotation-guide.md`：定义正/负样本、1~5 分质量、类型、边界规则、JSON 契约、标注集要求与指标口径。
+> - 新增 `tests/test_evaluation.py` 与 `tests/test_evaluation_cli.py`，覆盖标注校验、IoU、最大匹配反例、K 截断、无效/重复/负样本、macro/micro 聚合、目标检查、权重归一化、三个脚本的端到端路径。标签页另用真实 ffmpeg 生成 640×360 测试视频验证缩略图/上下文/模板输出。
+> - 全量 **598 passed**，覆盖率 **87%**（`src/evaluation.py` 99%），`ruff check` 与 `git diff --check` 全绿。
+> - **真实标注集仍未完成**：仓库目前没有 5~10 场人工标注数据，上述指标目标只能作为初始建议；下一步需要在真实场次上运行 `label_report.py` 标出正/负样本，再用 `evaluate.py` 建立基线，之后才能讨论目标是否合理。
+
 ### S5-7 Profile 与权重
 
 - 先做权重归一化和手工网格搜索；

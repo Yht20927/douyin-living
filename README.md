@@ -133,6 +133,9 @@ data/300294032039/
 ├── scores.json                            ← 全时间轴得分
 ├── recall_candidates.json                 ← 两阶段模式：阶段 A 候选窗口
 ├── pipeline_status.json                   ← 每步状态/耗时/缓存统计
+├── annotations.json                       ← 人工标注（S5-6，手动维护）
+├── eval.json                              ← 评估报告（S5-6，可选）
+├── label_report/                          ← 候选审核页 + 标注模板（S5-6）
 ├── *.meta.json                            ← 产物缓存元数据（源 hash/配置 hash）
 └── highlights/
     ├── clip_342s_dmDensity+asrKeyword.mp4 ← 切片视频
@@ -280,6 +283,46 @@ resume: true
   `--only-step asr` 重跑 ASR，再用 `--from-step signal` 继续；
 - `faster-whisper` 固定在 1.x、`whisperx` 固定在 3.x，避免上游 API 漂移。
 
+### 评估、调权与标注（Sprint 5 / S5-6）
+
+S5-6 提供三套离线工具，全部读取已有产物，不重新跑模型：
+
+```bash
+# 1. 评估：time_table.json + 人工标注 JSON
+python scripts/evaluate.py \
+  --time-table data/300294032039/time_table.json \
+  --annotations data/300294032039/annotations.json \
+  --k 5 --k 10 --json /tmp/eval.json
+
+# 2. 多场聚合（--case 可重复）
+python scripts/evaluate.py \
+  --case data/room1/time_table.json data/room1/annotations.json \
+  --case data/room2/time_table.json data/room2/annotations.json \
+  --k 5 --fail-on-target
+
+# 3. 在固定特征上调权，不重跑音频/文本/视觉
+python scripts/tune_weights.py \
+  --case data/room1/time_table.json data/room1/annotations.json \
+  --profile default --k 5 --strategy random --iterations 200 \
+  --output-yaml /tmp/default.tuned.yaml --json /tmp/tune.json
+
+# 4. 生成候选审核页和标注模板（自动选择同目录最大的 mp4/flv）
+python scripts/label_report.py \
+  --time-table data/300294032039/time_table.json \
+  --top 10 --output data/300294032039/label_report
+```
+
+评估输出：
+
+- Precision@K / Recall@K / F1@K；
+- Boundary IoU 与 Editing Cost；
+- Invalid Rate、Duplicate Rate、Negative Hit Rate；
+- 逐 case 指标 + macro/micro 聚合 + 目标检查。
+
+口径与标注规范见 `docs/annotation-guide.md`。初始目标（P@K≥0.6、R@K≥0.7、
+Boundary IoU≥0.5、Invalid≤0.2、Duplicate≤0.1）只是建议值，必须用真实标注
+校准；仓库当前尚未包含 5~10 场真实人工标注，不能把这些数字当对外 SLA。
+
 ### 直播类型预设
 
 | Profile | 适用场景 | 核心权重 |
@@ -334,6 +377,7 @@ resume: true
 | 文档 | 说明 |
 |------|------|
 | `docs/runbook.md` | 运行手册：Cookie/无流/ffmpeg/模型/磁盘/ASR OOM 与日志排查 |
+| `docs/annotation-guide.md` | S5-6 标注规范、JSON 格式、指标口径与审核页用法 |
 | `docs/superpowers/specs/2026-06-03-ai-clip-design.md` | AI 切片系统完整设计文档 |
 | `config/keywords.json` | 关键词词典（高能/搞笑/争议/互动/情感/带货） |
 
