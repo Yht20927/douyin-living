@@ -311,7 +311,13 @@ class VisualSettings(_YamlSectionSettings):
     _yaml_name: ClassVar[str] = "visual"
 
     scene_threshold: float = Field(default=27.0, gt=0.0)
+    scene_min_gap_sec: float = Field(default=1.0, ge=0.0)
     fps_fallback: int = Field(default=30, gt=0)
+    proxy_enabled: bool = True
+    proxy_height: int = Field(default=480, ge=120)
+    proxy_timeout_sec: int = Field(default=1800, gt=0)
+    sample_fps: float = Field(default=2.0, gt=0.0, le=30.0)
+    enable_face: bool = False
     opticalflow_resolution: tuple[int, int] = Field(default=(320, 240))
     opticalflow_sample_interval: int = Field(default=5, ge=1)
     farneback_pyr_scale: float = Field(default=0.5, gt=0.0, lt=1.0)

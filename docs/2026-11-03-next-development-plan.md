@@ -662,6 +662,15 @@ src/pipeline/
 - 增加 `visual.proxy_height`、`visual.sample_fps`、`visual.enable_face` 配置；
 - 在基准脚本中记录“1 小时 1080p 视频的视觉耗时”，作为回归指标。
 
+> **S5-4 执行记录（2026-11-05）**：
+>
+> - 新增代理优先视觉链路：ffmpeg 将源视频转成 `sample_fps`（默认 2.0）、`proxy_height`（默认 480）的临时 MP4，源视频只解码一次；随后单次 OpenCV pass 在代理上同时计算场景切点与 Farneback 光流运动。
+> - 场景切点使用与 ContentDetector 同量纲的 HSV 三通道平均绝对差（0~765），沿用 `scene_threshold`，并新增 `scene_min_gap_sec` 防止 1 秒内重复切点；运动仍映射到 1 Hz 时间轴。
+> - ffmpeg/编码器不可用、输入缺失或超时（`proxy_timeout_sec`）时自动回退旧 PySceneDetect + OpenCV 双解码路径；`visual_features.json` 的 `stats.mode`、`stats.sceneDetector`、`stats.sourceDecodePasses`、`stats.proxy.fallbackReason` 记录实际路径。
+> - 新增 `visual.proxy_enabled/proxy_height/proxy_timeout_sec/sample_fps/enable_face` 配置；`enable_face` 默认关闭，人脸检测继续只对候选窗口关键帧运行（Phase 2）。
+> - 新增 `scripts/benchmark_visual.py`：支持 `--legacy` 对比、多次运行、JSON 落盘，记录 `elapsedSec`、`realtimeFactor`、场景数与解码路径，用于 1 小时 1080p 视频回归。
+> - 测试覆盖代理命令构造、ffmpeg 缺失、单次 pass 切点/运动、时间轴补齐、代理成功清理、失败回退与关闭代理路径。全量 **507 passed**，覆盖率 **86%**，`ruff check` 与 `git diff --check` 全绿；另用 3 秒真实 ffmpeg 样本验证了代理与 legacy 两条路径。
+
 ### S5-5 ASR 配置与质量
 
 - 新增 `config/asr.yaml`：模型大小、设备、compute type、语言、是否 diarize、batch size、VAD 参数；

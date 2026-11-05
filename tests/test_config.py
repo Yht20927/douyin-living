@@ -96,7 +96,13 @@ class TestVisualSettingsDefaults:
     def test_defaults(self):
         s = VisualSettings()
         assert s.scene_threshold == 27.0
+        assert s.scene_min_gap_sec == 1.0
         assert s.fps_fallback == 30
+        assert s.proxy_enabled is True
+        assert s.proxy_height == 480
+        assert s.proxy_timeout_sec == 1800
+        assert s.sample_fps == 2.0
+        assert s.enable_face is False
         assert s.opticalflow_resolution == (320, 240)
         assert s.opticalflow_sample_interval == 5
 
@@ -165,6 +171,21 @@ class TestEnvironmentOverrides:
         assert settings.utr_calibration_max == 0.5
         assert settings.dm_rate_window_radius == 3
         assert settings.sentiment_mode == "hybrid"
+
+    def test_visual_proxy_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("VISUAL_PROXY_ENABLED", "false")
+        monkeypatch.setenv("VISUAL_PROXY_HEIGHT", "360")
+        monkeypatch.setenv("VISUAL_PROXY_TIMEOUT_SEC", "600")
+        monkeypatch.setenv("VISUAL_SAMPLE_FPS", "4")
+        monkeypatch.setenv("VISUAL_ENABLE_FACE", "true")
+        monkeypatch.setenv("VISUAL_SCENE_MIN_GAP_SEC", "2.5")
+        settings = VisualSettings()
+        assert settings.proxy_enabled is False
+        assert settings.proxy_height == 360
+        assert settings.proxy_timeout_sec == 600
+        assert settings.sample_fps == 4.0
+        assert settings.enable_face is True
+        assert settings.scene_min_gap_sec == 2.5
 
     def test_pipeline_asr_env_overrides(self, monkeypatch):
         monkeypatch.setenv("PIPELINE_ASR_MODEL", "tiny")

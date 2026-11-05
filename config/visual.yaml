@@ -1,5 +1,16 @@
 scene_threshold: 27.0
+# Minimum time between two detected cuts on the proxy timeline.
+scene_min_gap_sec: 1.0
 fps_fallback: 30
+# Proxy-first extraction: ffmpeg decodes the source once into a low-fps,
+# low-height file; scene + motion then run in one OpenCV pass over it.
+# Set proxy_enabled=false to use the legacy PySceneDetect + OpenCV path.
+proxy_enabled: true
+proxy_height: 480
+proxy_timeout_sec: 1800
+sample_fps: 2.0
+# Face detection stays on candidate-window keyframes (Phase 2).
+enable_face: false
 opticalflow_resolution: [320, 240]
 opticalflow_sample_interval: 5
 farneback_pyr_scale: 0.5

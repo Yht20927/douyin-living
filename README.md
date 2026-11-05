@@ -211,6 +211,35 @@ game 15~60s、default 15~90s；用户 `--min-duration/--max-duration` 始终是�
 相关参数位于 `config/text.yaml`，均支持 `TEXT_*` 环境变量。由于特征输出扩展，
 `GENERATOR_VERSION` 已提升到 `sprint5`，旧派生产物会自动重建。
 
+### 视觉性能（Sprint 5 / S5-4）
+
+默认流程先用 ffmpeg 把源视频转成低帧率、低高度代理文件，再由单次 OpenCV
+解码同时计算场景切点（HSV 帧差）与光流运动，源视频只解码一次：
+
+```text
+源视频 ──ffmpeg──→ proxy (sample_fps, proxy_height)
+                         │
+                         └─ 单次 OpenCV pass → sceneChange + motion
+```
+
+- `visual.proxy_enabled=true`：启用代理优先路径；ffmpeg 缺失或失败时自动回退旧的
+  PySceneDetect + OpenCV 双解码路径，提取不会中断；
+- `visual.sample_fps`（默认 2.0）与 `visual.proxy_height`（默认 480）控制代理大小；
+- `visual.enable_face=false`：人脸检测留给候选窗口关键帧（Phase 2）；
+- `visual_features.json` 在 `stats.mode` / `stats.sourceDecodePasses`
+  中记录实际路径，`stats.proxy.fallbackReason` 记录回退原因。
+
+基准脚本可在同一台机器上对比新旧路径：
+
+```bash
+python scripts/benchmark_visual.py --video /data/1h-1080p.flv
+python scripts/benchmark_visual.py --video /data/1h-1080p.flv --legacy
+python scripts/benchmark_visual.py --video /data/1h-1080p.flv --json /tmp/visual.json
+```
+
+建议用 1 小时 1080p 文件记录 `elapsedSec` 与 `realtimeFactor`，作为后续视觉改动的
+回归指标。
+
 ### 直播类型预设
 
 | Profile | 适用场景 | 核心权重 |
@@ -231,7 +260,7 @@ game 15~60s、default 15~90s；用户 `--min-duration/--max-duration` 始终是�
 | 音频 | librosa + panns-inference | RMS/MFCC + 事件检测 |
 | ASR | faster-whisper + WhisperX | 语音识别 + 说话人分离 |
 | NLP | jieba + FastText + text2vec + HF transformers | 分词/模糊匹配/聚类/情感 |
-| 视觉 | scenedetect + OpenCV + insightface | 场景/光流/人脸 |
+| 视觉 | ffmpeg 代理 + OpenCV（PySceneDetect 回退）+ insightface | 场景/光流/人脸 |
 | 数学 | numpy + scipy + scikit-image | EWMA/Z-Score/互相关/SSIM/t-test |
 | 剪辑 | ffmpeg | 无损裁剪 + 字幕烧录 + 缩略图 |
 
