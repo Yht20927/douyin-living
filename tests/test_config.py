@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """Tests for config module — settings loading, defaults, env overrides."""
 
-import os
 import pytest
+from pydantic import ValidationError
+
 from src.config import (
     load_settings,
     reload_settings,
@@ -107,3 +108,82 @@ class TestPipelineSettingsDefaults:
         assert s.sensitivity_default == 2.5
         assert s.signal_pool_workers == 3
         assert s.ffmpeg_timeout_clip == 300
+
+
+class TestEnvironmentOverrides:
+    """YAML must be a *default*, not a constructor argument that outranks env."""
+
+    def test_nested_scorer_env_override(self, monkeypatch):
+        monkeypatch.setenv("SCORER_DETECTION__WINDOWS", "[5,15,45]")
+        settings = ScorerSettings()
+        assert settings.detection.windows == [5, 15, 45]
+
+    def test_flat_env_override(self, monkeypatch):
+        monkeypatch.setenv("AUDIO_PANNS_RMS_THRESHOLD", "9.9")
+        settings = AudioSettings()
+        assert settings.panns_rms_threshold == 9.9
+
+    def test_pipeline_min_duration_env(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_MIN_DURATION_DEFAULT", "8.5")
+        settings = PipelineSettings()
+        assert settings.min_duration_default == 8.5
+
+    def test_explicit_init_still_wins(self, monkeypatch):
+        monkeypatch.setenv("AUDIO_PANNS_RMS_THRESHOLD", "9.9")
+        settings = AudioSettings(panns_rms_threshold=1.25)
+        assert settings.panns_rms_threshold == 1.25
+
+
+class TestProfileValidation:
+    def test_profiles_are_normalized(self):
+        settings = ScorerSettings(
+            profiles={"p": {"dmDensity": 1.0, "rms": 3.0}},
+        )
+        assert sum(settings.profiles["p"].values()) == pytest.approx(1.0)
+        assert settings.profiles["p"]["rms"] == pytest.approx(0.75)
+
+    def test_non_unit_sum_rejected_when_normalization_disabled(self):
+        with pytest.raises(ValidationError, match="weights sum"):
+            ScorerSettings(
+                normalize_profiles=False,
+                profiles={"p": {"dmDensity": 0.5, "rms": 0.3}},
+            )
+
+    def test_unknown_feature_key_rejected(self):
+        with pytest.raises(ValidationError, match="unknown feature"):
+            ScorerSettings(profiles={"p": {"notAFeature": 1.0}})
+
+    def test_negative_weight_rejected(self):
+        with pytest.raises(ValidationError, match="negative weight"):
+            ScorerSettings(profiles={"p": {"dmDensity": -0.5, "rms": 1.5}})
+
+    def test_empty_profile_rejected(self):
+        with pytest.raises(ValidationError, match="non-empty"):
+            ScorerSettings(profiles={"p": {}})
+
+
+class TestStructuralValidation:
+    def test_min_duration_must_be_below_max(self):
+        with pytest.raises(ValidationError, match="min_clip_duration"):
+            ScorerSettings(
+                detection={"min_clip_duration": 90.0, "max_clip_duration": 15.0}
+            )
+
+    def test_windows_must_be_sorted(self):
+        with pytest.raises(ValidationError, match="sorted"):
+            ScorerSettings(detection={"windows": [30, 10, 3]})
+
+    def test_windows_must_not_be_empty(self):
+        with pytest.raises(ValidationError, match="must not be empty"):
+            ScorerSettings(detection={"windows": []})
+
+    def test_pipeline_duration_bounds(self):
+        with pytest.raises(ValidationError, match="min_duration_default"):
+            PipelineSettings(min_duration_default=90.0, max_duration_default=15.0)
+
+    def test_text_cluster_bounds(self):
+        with pytest.raises(ValidationError, match="topic_kmeans_clusters_min"):
+            TextSettings(
+                topic_kmeans_clusters_min=6,
+                topic_kmeans_clusters_max=3,
+            )

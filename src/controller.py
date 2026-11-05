@@ -11,11 +11,13 @@ import asyncio
 import json
 import os
 import queue
+import shutil
 import signal
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,14 @@ from src.protobuf.Live_pb2 import LiveResponse
 from src.log.logger import getLogger
 from src.util import fmtSize
 from src.config import load_settings
+from src.contracts import (
+    RecordingMeta,
+    artifactFingerprint,
+    inspectAsrArtifact,
+    inspectFeatureArtifact,
+    probeMedia,
+)
+from src.pipeline import PipelineStatus, StepStatus
 
 log = getLogger(__name__)
 _cfg = load_settings().pipeline
@@ -81,6 +91,7 @@ class Controller:
         self._flvPath: str | None = None
         self._flvRecorder: FlvRecorder | None = None
         self._recordStartTime: float = 0.0  # wall-clock seconds when recording started
+        self._recordStartMono: float = 0.0
         self._danmakuQueue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._writerThread: threading.Thread | None = None
         self._writerStop = threading.Event()
@@ -170,6 +181,7 @@ class Controller:
 
         # 5. Danmaku WS
         self._recordStartTime = time.time()
+        self._recordStartMono = time.monotonic()
         Path(self.outputDir).mkdir(parents=True, exist_ok=True)
         jsonlPath = os.path.join(self.outputDir, f"{self.webRid}_danmaku.jsonl")
 
@@ -238,14 +250,36 @@ class Controller:
         except Exception as e:
             log.warning(f"FLV not available: {e}")
 
-        # 7. Wait for stop
+        # 7. Wait for stop, or for the recorder to end on its own (live
+        # ended / unrecoverable network failure / low disk).  Without this
+        # race a dead stream would leave the controller waiting forever.
         loop = asyncio.get_event_loop()
         try:
             loop.add_signal_handler(signal.SIGINT, lambda: self._stopEvent.set())
         except NotImplementedError:
             pass
 
-        await self._stopEvent.wait()
+        stopTask = asyncio.create_task(self._stopEvent.wait())
+        try:
+            if self._flvTask is not None:
+                await asyncio.wait(
+                    {stopTask, self._flvTask},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if self._flvTask.done() and not self._stopEvent.is_set():
+                    if not self._flvTask.cancelled() and self._flvTask.exception():
+                        log.error(
+                            "FLV recorder failed: %r", self._flvTask.exception()
+                        )
+                    stopReason = getattr(self._flvRecorder, "stopReason", None)
+                    log.info(
+                        "FLV recorder finished (%s); finalizing recording",
+                        stopReason or "ended",
+                    )
+            else:
+                await stopTask
+        finally:
+            stopTask.cancel()
         await self.stop()
 
         # Collect every FLV segment that was rotated out, plus the in-progress one.
@@ -264,6 +298,7 @@ class Controller:
             self._flvPath = merged
             audioPath = merged.rsplit(".", 1)[0] + ".aac"
             await self._extractAudio(merged, audioPath)
+            await self._writeRecordingMeta(merged, audioPath, segments)
 
     # ── Clipping pipeline ──────────────────────────────────────
 
@@ -273,11 +308,39 @@ class Controller:
         await self._runClippingPipeline()
 
     async def _runClippingPipeline(self):
-        """Run the full AI clipping pipeline on recorded data."""
+        """Run the full AI clipping pipeline on recorded data.
+
+        The status document is written even when the pipeline fails or
+        produces zero clips.  Every step records timing, inputs/outputs,
+        artifact hashes and an explicit status (ok/empty/failed/skipped).
+        """
         log.info("=" * 50)
         log.info("Starting AI clipping pipeline")
         log.info("=" * 50)
+        os.makedirs(self.outputDir, exist_ok=True)
 
+        statusPath = os.path.join(self.outputDir, "pipeline_status.json")
+        status = PipelineStatus(
+            roomId=self.webRid,
+            outputDir=self.outputDir,
+            profile=self.profile,
+            sensitivity=self.sensitivity,
+        )
+        try:
+            await self._runClippingPipelineInner(status)
+        except Exception as exc:
+            log.exception("Clipping pipeline crashed")
+            status.setStep(
+                "0_pipeline",
+                StepStatus.FAILED,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            status.save(statusPath)
+            log.info(f"Pipeline status: {statusPath}")
+
+    async def _runClippingPipelineInner(self, status: PipelineStatus):
+        """Actual pipeline body — always called under status accounting."""
         # Resolve the source video. Prefer a previously merged file
         # (data/{roomId}/{roomId}_merged.mp4); otherwise auto-merge any FLV
         # segments we find on disk so multi-segment recordings work end-to-end.
@@ -288,6 +351,11 @@ class Controller:
             flvFiles = sorted(Path(self.outputDir).glob("*.flv"))
             if not flvFiles:
                 log.error(f"No FLV files in {self.outputDir}")
+                status.setStep(
+                    "0_input",
+                    StepStatus.FAILED,
+                    error=f"no FLV/MP4 input in {self.outputDir}",
+                )
                 return
             if len(flvFiles) == 1:
                 # Re-mux single FLV to MP4 so downstream tools (OpenCV,
@@ -324,41 +392,102 @@ class Controller:
         log.info(f"Audio: {audioPath}")
         log.info(f"Profile: {self.profile}, Sensitivity: {self.sensitivity}")
 
-        # Step 1: Extract audio (if not exists)
-        if not os.path.exists(audioPath):
+        # ── Step 1: Extract audio ──────────────────────────────
+        status.startStep("1_audio_extract", inputs=[videoPath])
+        if os.path.exists(audioPath):
+            log.info("Step 1: Audio exists, reusing")
+            status.finishStep(
+                "1_audio_extract",
+                StepStatus.SKIPPED,
+                outputs=[audioPath],
+                meta={"reused": True},
+            )
+        else:
             log.info("Step 1: Extracting audio...")
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-i", videoPath, "-vn", "-acodec", "copy", "-y", audioPath,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
-            if not os.path.exists(audioPath):
-                log.error("Audio extraction failed")
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not os.path.exists(audioPath):
+                err = stderr.decode(errors="replace")[-300:] if stderr else ""
+                log.error(f"Audio extraction failed: {err}")
+                status.finishStep(
+                    "1_audio_extract",
+                    StepStatus.FAILED,
+                    error=err or "ffmpeg produced no audio file",
+                )
                 return
             log.info(f"Audio: {audioPath}")
+            status.finishStep("1_audio_extract", StepStatus.OK, outputs=[audioPath])
 
-        # Step 2: ASR + diarization (skip if model unavailable)
+        # Probe the real media duration and persist the recording contract.
+        recordingMeta = await self._writeRecordingMeta(
+            videoPath, audioPath,
+            [str(p) for p in sorted(Path(self.outputDir).glob("*.flv"))],
+        )
+        durationSec = recordingMeta.videoDurationSec or recordingMeta.ffprobe.get(
+            "durationSec", 0.0
+        )
+        log.info(f"Recording duration: {durationSec:.1f}s")
+
+        # ── Step 2: ASR + diarization ──────────────────────────
         log.info("Step 2: ASR...")
         asrPath = audioPath.rsplit(".", 1)[0] + "_asr.json"
-        if not os.path.exists(asrPath):
+        status.startStep("2_asr", inputs=[audioPath])
+        if os.path.exists(asrPath):
+            asrInfo = inspectAsrArtifact(asrPath)
+            log.info(f"ASR exists: {asrPath} (status={asrInfo['status']})")
+            status.finishStep(
+                "2_asr",
+                asrInfo["status"],
+                outputs=[asrPath],
+                error="; ".join(asrInfo["errors"]) or None,
+                meta={
+                    "reused": True,
+                    "segments": asrInfo["segments"],
+                    "duration": asrInfo["duration"],
+                },
+            )
+            if asrInfo["status"] == "failed":
+                log.warning(
+                    "ASR was previously marked failed — delete the ASR JSON to retry"
+                )
+        else:
             try:
                 from asr import transcribe
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 log.info(f"ASR device: {device}")
                 # Offload blocking ASR to thread pool so the event loop stays alive
-                await asyncio.to_thread(transcribe, audioPath, device=device, diarize=True, outputPath=asrPath)
-            except Exception:
-                log.warning("ASR failed — marking as unavailable", exc_info=True)
-                with open(asrPath, "w") as f:
-                    json.dump({"status": "failed", "segments": []}, f)
-        else:
-            log.info(f"ASR exists: {asrPath}")
+                await asyncio.to_thread(
+                    transcribe, audioPath, device=device, diarize=True,
+                    outputPath=asrPath,
+                )
+                asrInfo = inspectAsrArtifact(asrPath)
+                status.finishStep(
+                    "2_asr",
+                    asrInfo["status"],
+                    outputs=[asrPath],
+                    error="; ".join(asrInfo["errors"]) or None,
+                    meta={"segments": asrInfo["segments"]},
+                )
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                log.warning(f"ASR failed — marking as unavailable: {err}", exc_info=True)
+                with open(asrPath, "w", encoding="utf-8") as f:
+                    json.dump({"status": "failed", "segments": [], "error": err}, f)
+                status.finishStep(
+                    "2_asr",
+                    StepStatus.FAILED,
+                    outputs=[asrPath],
+                    error=err,
+                )
 
         # Step 3: Preprocess (auto-editor, optional)
         # Skipped in Phase 1 — requires --preprocess flag
 
-        # Step 4-6: Signal extraction (parallel)
+        # ── Step 4-6: Signal extraction (parallel) ─────────────
         log.info("Steps 4-6: Extracting signals (parallel)...")
         audioFeatPath = os.path.join(self.outputDir, "audio_features.json")
         textFeatPath = os.path.join(self.outputDir, "text_features.json")
@@ -366,102 +495,214 @@ class Controller:
 
         def _runAudio(audPath: str, outPath: str):
             from src.signalAudio import extractFeatures
-            extractFeatures(audPath, outputPath=outPath)
+            extractFeatures(audPath, outputPath=outPath, durationSec=durationSec or None)
 
-        def _runText(danPath: str, asrPath: str, outPath: str):
+        def _runText(danPath: str, asrFilePath: str, outPath: str):
             from src.signalText import extractFeatures
-            extractFeatures(danPath, asrPath, outputPath=outPath)
+            extractFeatures(
+                danPath, asrFilePath, outputPath=outPath,
+                durationSec=durationSec or None,
+            )
 
         def _runVisual(vidPath: str, outPath: str):
             from src.signalVisual import extractFeatures
-            extractFeatures(vidPath, outputPath=outPath)
+            extractFeatures(vidPath, outputPath=outPath, durationSec=durationSec or None)
 
-        # Track which signal extractors actually succeeded — passes through
-        # to pipeline_status.json so a "failed" extractor is visible instead
-        # of silently producing an empty features file downstream.
+        signalSpecs = [
+            ("4_audio_signal", audioFeatPath, [audioPath], _runAudio),
+            ("5_text_signal", textFeatPath, [danmakuPath, asrPath], _runText),
+            ("6_visual_signal", visualFeatPath, [videoPath], _runVisual),
+        ]
         signalErrors: dict[str, str] = {}
+        artifactStatus: dict[str, str] = {}
+        futures: dict[str, Any] = {}
 
         with ThreadPoolExecutor(max_workers=_cfg.signal_pool_workers) as pool:
-            futures: dict[str, Any] = {}
-            if not os.path.exists(audioFeatPath):
-                futures["audio"] = pool.submit(_runAudio, audioPath, audioFeatPath)
-            else:
-                log.info(f"  Audio features exist, skipping: {audioFeatPath}")
+            for stepName, outPath, inputs, runner in signalSpecs:
+                if os.path.exists(outPath):
+                    info = inspectFeatureArtifact(outPath)
+                    if info["status"] == "ok":
+                        log.info(f"  {stepName}: valid artifact exists, reusing")
+                        artifactStatus[stepName] = "ok"
+                        status.setStep(
+                            stepName,
+                            StepStatus.SKIPPED,
+                            outputs=[outPath],
+                            meta={
+                                "reused": True,
+                                "featureCount": info["featureCount"],
+                                "duration": info["duration"],
+                            },
+                        )
+                        continue
+                    log.warning(
+                        f"  {stepName}: existing artifact is {info['status']} "
+                        f"({'; '.join(info['errors'])}) — regenerating"
+                    )
 
-            if not os.path.exists(textFeatPath):
-                if os.path.exists(danmakuPath) and os.path.exists(asrPath):
-                    futures["text"] = pool.submit(_runText, danmakuPath, asrPath, textFeatPath)
+                missing = [p for p in inputs if not os.path.exists(p)]
+                if missing:
+                    reason = "missing inputs: " + ", ".join(missing)
+                    log.warning(f"  {stepName}: {reason}")
+                    signalErrors[stepName] = reason
+                    artifactStatus[stepName] = "skipped"
+                    status.setStep(stepName, StepStatus.SKIPPED, error=reason)
+                    continue
+
+                status.startStep(stepName, inputs=inputs)
+                if stepName == "4_audio_signal":
+                    futures[stepName] = pool.submit(runner, inputs[0], outPath)
+                elif stepName == "5_text_signal":
+                    futures[stepName] = pool.submit(runner, inputs[0], inputs[1], outPath)
                 else:
-                    log.warning("  Missing danmaku or ASR — text features will be empty")
-                    signalErrors["text"] = "missing inputs (danmaku or ASR)"
+                    futures[stepName] = pool.submit(runner, inputs[0], outPath)
 
-            if not os.path.exists(visualFeatPath):
-                futures["visual"] = pool.submit(_runVisual, videoPath, visualFeatPath)
-            else:
-                log.info(f"  Visual features exist, skipping: {visualFeatPath}")
-
-            for name, f in futures.items():
+            outPathByStep = {name: out for name, out, _, _ in signalSpecs}
+            for stepName, future in futures.items():
+                outPath = outPathByStep[stepName]
                 try:
-                    f.result()
-                except Exception as e:
-                    log.error(f"{name} signal extraction failed", exc_info=True)
-                    # First line of the error is enough for the status file —
-                    # the full traceback already went to the log.
-                    signalErrors[name] = f"{type(e).__name__}: {e}"
+                    future.result()
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                    log.error(f"{stepName} signal extraction failed", exc_info=True)
+                    signalErrors[stepName] = err
+                    artifactStatus[stepName] = "failed"
+                    status.finishStep(stepName, StepStatus.FAILED, error=err)
+                    continue
 
-        # Load features for scorer (defensively — null values in JSON are
-        # replaced with empty feature dicts to prevent downstream crashes).
-        audioFeat = self._safe_load_features(audioFeatPath)
-        textFeat = self._safe_load_features(textFeatPath)
-        visualFeat = self._safe_load_features(visualFeatPath)
+                info = inspectFeatureArtifact(outPath)
+                artifactStatus[stepName] = info["status"]
+                stepStatus = (
+                    StepStatus.FAILED if info["status"] == "missing" else info["status"]
+                )
+                status.finishStep(
+                    stepName,
+                    stepStatus,
+                    outputs=[outPath],
+                    error="; ".join(info["errors"]) or None,
+                    meta={
+                        "featureCount": info["featureCount"],
+                        "duration": info["duration"],
+                        "featureNames": info["featureNames"],
+                    },
+                )
 
-        if not audioFeat and not textFeat and not visualFeat:
-            log.error("No features extracted — cannot score")
+        # Load only artifacts that passed validation.  An empty/invalid file
+        # is never handed to the scorer as if it were a real signal.
+        def _loadSignal(outPath: str, stepName: str) -> dict:
+            if artifactStatus.get(stepName) != "ok":
+                return {"features": {}}
+            loaded = self._safe_load_features(outPath)
+            return loaded or {"features": {}}
+
+        audioFeat = _loadSignal(audioFeatPath, "4_audio_signal")
+        textFeat = _loadSignal(textFeatPath, "5_text_signal")
+        visualFeat = _loadSignal(visualFeatPath, "6_visual_signal")
+
+        if not any(feat.get("features") for feat in (audioFeat, textFeat, visualFeat)):
+            log.error("No valid features extracted — cannot score")
+            status.setStep(
+                "7_scorer",
+                StepStatus.FAILED,
+                error="no valid feature artifacts",
+            )
             return
 
-        # Step 7: Scoring
+        # ── Step 7: Scoring ────────────────────────────────────
         log.info("Step 7: Scoring...")
         timeTablePath = os.path.join(self.outputDir, "time_table.json")
         scoresPath = os.path.join(self.outputDir, "scores.json")
         from src.scorer import score
-        result = score(
-            roomId=self.webRid,
-            audioFeatures=audioFeat or {"features": {}},
-            textFeatures=textFeat or {"features": {}},
-            visualFeatures=visualFeat or {"features": {}},
-            profile=self.profile,
-            sensitivity=self.sensitivity,
-            minDuration=self.minDuration,
-            maxDuration=self.maxDuration,
-            outputPath=timeTablePath,
-            scoresPath=scoresPath,
+        status.startStep(
+            "7_scorer",
+            inputs=[audioFeatPath, textFeatPath, visualFeatPath],
         )
-
-        if not result.get("clips"):
-            log.warning("No clips detected — try lowering sensitivity")
+        try:
+            result = score(
+                roomId=self.webRid,
+                audioFeatures=audioFeat,
+                textFeatures=textFeat,
+                visualFeatures=visualFeat,
+                profile=self.profile,
+                sensitivity=self.sensitivity,
+                minDuration=self.minDuration,
+                maxDuration=self.maxDuration,
+                durationSec=durationSec or None,
+                outputPath=timeTablePath,
+                scoresPath=scoresPath,
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.exception("Scoring failed")
+            status.finishStep("7_scorer", StepStatus.FAILED, error=err)
             return
 
-        # Step 8: Clipping
+        clips = result.get("clips") or []
+        status.finishStep(
+            "7_scorer",
+            StepStatus.OK if clips else StepStatus.EMPTY,
+            outputs=[timeTablePath, scoresPath],
+            error=None if clips else "no candidate clips survived detection",
+            meta={
+                "clips": len(clips),
+                "dropped": len(result.get("dropped") or []),
+                "adjustments": len(result.get("adjustments") or []),
+                "alignedSignals": len(result.get("alignment") or []),
+            },
+        )
+
+        if not clips:
+            log.warning("No clips detected — see time_table.json dropped reasons")
+            status.setStep(
+                "8_clipping",
+                StepStatus.SKIPPED,
+                error="no clips to cut",
+            )
+            return
+
+        # ── Step 8: Clipping ───────────────────────────────────
         log.info("Step 8: Clipping video...")
         highlightsDir = os.path.join(self.outputDir, "highlights")
         from src.clipper import clipVideo, extractThumbnail, generateClipSrt
-        # Offload blocking ffmpeg calls to thread pool
-        clipPaths = await asyncio.to_thread(
-            clipVideo, videoPath, timeTablePath, highlightsDir,
-            dryRun=self.dryRun, resolution=self.resolution,
-        )
-
+        status.startStep("8_clipping", inputs=[videoPath, timeTablePath])
         if self.dryRun:
-            log.info("--dry-run mode: skipping subtitle burn and thumbnails")
+            log.info("--dry-run mode: skipping video cutting")
+            status.finishStep(
+                "8_clipping",
+                StepStatus.SKIPPED,
+                meta={"dryRun": True, "candidates": len(clips)},
+            )
             log.info(f"Candidate report saved: {timeTablePath}")
             log.info(f"Scores timeline saved: {scoresPath}")
             return
 
-        # Step 9: Generate segment-level SRT + thumbnails
+        try:
+            # Offload blocking ffmpeg calls to thread pool
+            clipPaths = await asyncio.to_thread(
+                clipVideo, videoPath, timeTablePath, highlightsDir,
+                dryRun=False, resolution=self.resolution,
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.exception("Video clipping failed")
+            status.finishStep("8_clipping", StepStatus.FAILED, error=err)
+            return
+
+        status.finishStep(
+            "8_clipping",
+            StepStatus.OK if clipPaths else StepStatus.EMPTY,
+            outputs=[path for path, _ in clipPaths],
+            error=None if clipPaths else "ffmpeg produced no clip files",
+            meta={"clips": len(clipPaths)},
+        )
+
+        # ── Step 9: segment-level SRT + thumbnails ─────────────
         log.info("Step 9: Generating subtitles and thumbnails...")
+        status.startStep("9_subtitles_thumbnails")
         srtPath = asrPath.rsplit(".", 1)[0] + ".srt"
         srtFailures = 0
         thumbFailures = 0
+        generated: list[str] = []
         for clipPath, clip in clipPaths:
             # Generate clip-specific SRT — best effort, the clip itself is
             # already produced and usable without subtitles.
@@ -470,6 +711,7 @@ class Controller:
                 await asyncio.to_thread(
                     generateClipSrt, srtPath, clip["start"], clip["end"], clipSrtPath,
                 )
+                generated.append(clipSrtPath)
             except Exception:
                 srtFailures += 1
                 log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)
@@ -479,6 +721,7 @@ class Controller:
                 await asyncio.to_thread(
                     extractThumbnail, videoPath, clip["thumbnailTime"], thumbPath,
                 )
+                generated.append(thumbPath)
             except Exception:
                 thumbFailures += 1
                 log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
@@ -486,39 +729,78 @@ class Controller:
             log.warning(f"{srtFailures}/{len(clipPaths)} clips have no SRT")
         if thumbFailures:
             log.warning(f"{thumbFailures}/{len(clipPaths)} clips have no thumbnail")
+        status.finishStep(
+            "9_subtitles_thumbnails",
+            StepStatus.OK if not (srtFailures and thumbFailures) else StepStatus.EMPTY,
+            outputs=generated,
+            meta={
+                "srtFailures": srtFailures,
+                "thumbnailFailures": thumbFailures,
+            },
+        )
 
         log.info("=" * 50)
         log.info(f"Clipping complete: {len(clipPaths)} clips → {highlightsDir}")
         log.info("=" * 50)
 
-        # Write pipeline status. Each extractor records "ok" / "skipped" /
-        # "failed: <reason>" so a missing features file is distinguishable
-        # from a crashed extractor.
-        def _stepStatus(name: str, outPath: str) -> str:
-            if name in signalErrors:
-                return f"failed: {signalErrors[name]}"
-            return "ok" if os.path.exists(outPath) else "skipped"
+    async def _writeRecordingMeta(
+        self,
+        videoPath: str,
+        audioPath: str | None,
+        segments: list[str],
+    ) -> RecordingMeta:
+        """Probe real media durations and write recording_meta.json atomically."""
+        metaPath = os.path.join(self.outputDir, "recording_meta.json")
+        probe = await asyncio.to_thread(probeMedia, videoPath)
+        audioProbe: dict[str, Any] = {}
+        if audioPath and os.path.exists(audioPath):
+            audioProbe = await asyncio.to_thread(probeMedia, audioPath)
 
-        statusPath = os.path.join(self.outputDir, "pipeline_status.json")
-        status = {
-            "roomId": self.webRid,
-            "profile": self.profile,
-            "sensitivity": self.sensitivity,
-            "steps": {
-                "1_audio_extract": "ok",
-                "2_asr": "ok" if os.path.exists(asrPath) else "skipped",
-                "4_audio_signal": _stepStatus("audio", audioFeatPath),
-                "5_text_signal": _stepStatus("text", textFeatPath),
-                "6_visual_signal": _stepStatus("visual", visualFeatPath),
-                "7_scorer": "ok" if result.get("clips") else "no_clips",
-                "8_clipping": "ok" if clipPaths else "no_clips",
-            },
-            "clips": len(clipPaths),
-            "outputDir": highlightsDir,
-        }
-        with open(statusPath, "w") as f:
-            json.dump(status, f, ensure_ascii=False, indent=2)
-        log.info(f"Pipeline status: {statusPath}")
+        existing = RecordingMeta.load(metaPath)
+        sourceHashes: dict[str, Any] = {}
+        for segment in segments:
+            fingerprint = artifactFingerprint(segment)
+            if fingerprint is not None:
+                sourceHashes[segment] = fingerprint
+
+        recorder = self._flvRecorder
+        firstData = getattr(recorder, "firstDataAt", None) if recorder else None
+        if hasattr(firstData, "isoformat"):
+            firstData = firstData.isoformat()
+        elif not isinstance(firstData, str):
+            firstData = existing.firstVideoDataAt if existing else None
+
+        startedAtWall = existing.startedAtWall if existing else None
+        if not startedAtWall and self._recordStartTime:
+            startedAtWall = datetime.fromtimestamp(
+                self._recordStartTime, timezone.utc
+            ).isoformat(timespec="seconds")
+
+        meta = RecordingMeta(
+            roomId=self.webRid,
+            startedAtWall=startedAtWall,
+            startedAtMonotonic=(
+                existing.startedAtMonotonic
+                if existing
+                else (self._recordStartMono or None)
+            ),
+            firstVideoDataAt=firstData,
+            videoDurationSec=float(
+                probe.get("videoDurationSec") or probe.get("durationSec") or 0.0
+            ),
+            audioDurationSec=float(
+                audioProbe.get("audioDurationSec")
+                or audioProbe.get("durationSec")
+                or probe.get("audioDurationSec")
+                or 0.0
+            ),
+            segments=list(segments),
+            sourceHashes=sourceHashes,
+            ffprobe=probe,
+        )
+        meta.save(metaPath)
+        log.info(f"Recording metadata: {metaPath}")
+        return meta
 
     # ── helpers ────────────────────────────────────────────────
 
@@ -582,6 +864,28 @@ class Controller:
         valid = [s for s in segments if s and os.path.exists(s)]
         if not valid:
             return None
+
+        # Never feed a half-written or corrupt segment into concat: it would
+        # poison the whole merged timeline.  Quarantine bad inputs first.
+        if shutil.which("ffprobe"):
+            probed: list[str] = []
+            for seg in valid:
+                info = probeMedia(seg)
+                duration = float(info.get("durationSec") or 0.0) if info else 0.0
+                if duration <= 0:
+                    target = self._quarantineSegment(seg)
+                    log.warning(
+                        "Quarantined corrupt FLV segment: %s → %s", seg, target
+                    )
+                    continue
+                probed.append(seg)
+            valid = probed
+            if not valid:
+                log.error("No usable FLV segments after validation")
+                return None
+        else:
+            log.warning("ffprobe not installed — merging segments without validation")
+
         if len(valid) == 1:
             return valid[0]
 
@@ -600,33 +904,71 @@ class Controller:
                     fh.write(f"file '{abs_seg}'\n")
 
             log.info(f"Merging {len(valid)} FLV segments → {outPath}")
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-f", "concat", "-safe", "0",
-                "-i", listPath, "-c", "copy",
-                "-bsf:a", "aac_adtstoasc", "-y", outPath,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0 or not os.path.exists(outPath):
-                errMsg = stderr.decode(errors="replace")[-300:] if stderr else ""
-                log.warning(f"FLV merge failed (code={proc.returncode}): {errMsg}")
+            ok = await self._concatFfmpeg(listPath, outPath, reencode=False)
+            if not ok:
+                log.warning("Lossless FLV merge failed — retrying with re-encode")
+                try:
+                    os.remove(outPath)
+                except OSError:
+                    pass
+                ok = await self._concatFfmpeg(listPath, outPath, reencode=True)
+            if not ok:
                 return None
             log.info(f"Merged: {outPath} ({fmtSize(os.path.getsize(outPath))})")
             return outPath
-        except FileNotFoundError:
-            log.warning("ffmpeg not installed — cannot merge FLV segments")
-            return None
         finally:
             try:
                 os.remove(listPath)
             except OSError:
                 pass
 
+    async def _concatFfmpeg(
+        self, listPath: str, outPath: str, reencode: bool
+    ) -> bool:
+        """Run one ffmpeg concat attempt; returns True on success."""
+        codecArgs = (
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k"]
+            if reencode
+            else ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-f", "concat", "-safe", "0",
+                "-i", listPath, *codecArgs, "-y", outPath,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            log.warning("ffmpeg not installed — cannot merge FLV segments")
+            return False
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(outPath):
+            errMsg = stderr.decode(errors="replace")[-300:] if stderr else ""
+            mode = "re-encode" if reencode else "stream-copy"
+            log.warning(
+                f"FLV merge failed ({mode}, code={proc.returncode}): {errMsg}"
+            )
+            return False
+        return True
+
+    def _quarantineSegment(self, path: str) -> str | None:
+        """Move an unreadable segment out of the merge path."""
+        corruptDir = os.path.join(self.outputDir, "corrupt")
+        try:
+            os.makedirs(corruptDir, exist_ok=True)
+            target = os.path.join(corruptDir, os.path.basename(path))
+            if os.path.exists(target):
+                target = f"{target}.{int(time.time())}"
+            os.replace(path, target)
+            return target
+        except OSError:
+            log.exception(f"Failed to quarantine segment: {path}")
+            return None
+
 
 # ── CLI ──────────────────────────────────────────────────────────
 
 async def main():
-    import sys
     import argparse
 
     parser = argparse.ArgumentParser(description="Douyin Live AI Clipper")

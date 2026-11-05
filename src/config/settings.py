@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """Pydantic-based settings — loads from config/*.yaml with env overrides.
 
+Priority (highest first):
+    1. explicit constructor arguments (tests / programmatic callers)
+    2. environment variables
+    3. ``.env`` file
+    4. ``config/<section>.yaml``
+    5. field defaults
+
 Usage::
 
     from src.config import load_settings
@@ -10,18 +17,21 @@ Usage::
 
 Environment variable override::
 
-    export SCORER_DETECTION_WINDOWS='[5,15,45]'
+    export SCORER_DETECTION__WINDOWS='[5,15,45]'
     export AUDIO_PANNS_RMS_THRESHOLD=1.5
 """
 
-import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_DIR = _PROJECT_ROOT / "config"
@@ -36,77 +46,133 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base (mutates base)."""
-    for key, val in override.items():
-        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
-            _deep_merge(base[key], val)
-        else:
-            base[key] = val
-    return base
+class _YamlSettingsSource(PydanticBaseSettingsSource):
+    """Settings source that reads a section from ``config/<name>.yaml``."""
+
+    def __init__(self, settings_cls: type[BaseSettings], yamlPath: Path):
+        super().__init__(settings_cls)
+        self._yamlPath = yamlPath
+
+    def get_field_value(self, field, field_name):  # pragma: no cover - unused path
+        data = _load_yaml(self._yamlPath)
+        return data.get(field_name), field_name, self.field_is_complex(field)
+
+    def __call__(self) -> dict[str, Any]:
+        return _load_yaml(self._yamlPath)
+
+
+class _YamlSectionSettings(BaseSettings):
+    """Base class: YAML defaults are lower priority than environment vars."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    _yaml_name: ClassVar[str] = ""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        yaml_path = _CONFIG_DIR / f"{settings_cls._yaml_name}.yaml"
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _YamlSettingsSource(settings_cls, yaml_path),
+            file_secret_settings,
+        )
 
 
 # ── sub-settings ─────────────────────────────────────────────────
 
 class _ScorerDetection(BaseModel):
     windows: list[int] = Field(default=[3, 10, 30])
-    nms_merge_distance: float = Field(default=15.0)
-    min_clip_duration: float = Field(default=15.0)
-    max_clip_duration: float = Field(default=90.0)
-    sensitivity_default: float = Field(default=2.5)
-    peak_persistence_frames: int = Field(default=3)
-    candidate_gap_sec: float = Field(default=3.0)
+    nms_merge_distance: float = Field(default=15.0, ge=0.0)
+    min_clip_duration: float = Field(default=15.0, gt=0.0)
+    max_clip_duration: float = Field(default=90.0, gt=0.0)
+    sensitivity_default: float = Field(default=2.5, gt=0.0)
+    peak_persistence_frames: int = Field(default=3, ge=1)
+    candidate_gap_sec: float = Field(default=3.0, ge=0.0)
     trigger_zscore_threshold: float = Field(default=2.0)
-    window_factor: int = Field(default=2)
+    window_factor: int = Field(default=2, ge=1)
+
+    @field_validator("windows")
+    @classmethod
+    def _validateWindows(cls, value: list[int]) -> list[int]:
+        if not value:
+            raise ValueError("detection.windows must not be empty")
+        if any(w <= 0 for w in value):
+            raise ValueError("detection.windows must contain positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("detection.windows must not contain duplicates")
+        if value != sorted(value):
+            raise ValueError("detection.windows must be sorted ascending")
+        return value
+
+    @model_validator(mode="after")
+    def _validateDurations(self):
+        if self.min_clip_duration >= self.max_clip_duration:
+            raise ValueError(
+                "detection.min_clip_duration must be smaller than max_clip_duration"
+            )
+        return self
 
 
 class _ScorerPreprocessing(BaseModel):
-    ewma_alpha: float = Field(default=0.3)
-    zscore_window_sec: int = Field(default=60)
-    zscore_eps: float = Field(default=1e-10)
-    median_filter_size: int = Field(default=5)
+    ewma_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
+    zscore_window_sec: int = Field(default=60, ge=2)
+    zscore_eps: float = Field(default=1e-10, gt=0.0)
+    median_filter_size: int = Field(default=5, ge=1)
 
 
 class _ScorerBoundary(BaseModel):
-    pad_sec: int = Field(default=5)
-    valley_search_range: int = Field(default=10)
-    valley_window_radius: int = Field(default=5)
+    pad_sec: int = Field(default=5, ge=0)
+    valley_search_range: int = Field(default=10, ge=0)
+    valley_window_radius: int = Field(default=5, ge=1)
 
 
 class _ScorerTTest(BaseModel):
-    pre_window_sec: int = Field(default=5)
-    pvalue_threshold: float = Field(default=0.05)
+    pre_window_sec: int = Field(default=5, ge=1)
+    pvalue_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
 
 
 class _ScorerGlobalDecay(BaseModel):
-    coeff: float = Field(default=0.1)
+    coeff: float = Field(default=0.1, ge=0.0)
 
 
 class _ScorerThumbnail(BaseModel):
-    offset_sec: float = Field(default=3.0)
+    offset_sec: float = Field(default=3.0, ge=0.0)
 
 
 class _ScorerBreakdown(BaseModel):
-    top_n: int = Field(default=5)
+    top_n: int = Field(default=5, ge=1)
 
 
 class _ScorerLagCompensation(BaseModel):
-    min_len: int = Field(default=10)
-    max_shift: int = Field(default=5)
+    min_len: int = Field(default=10, ge=1)
+    max_shift: int = Field(default=5, ge=0)
 
 
 class _ScorerBoost(BaseModel):
-    tanh_divisor: float = Field(default=2.0)
+    tanh_divisor: float = Field(default=2.0, gt=0.0)
 
 
-class ScorerSettings(BaseSettings):
+class ScorerSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(
         env_prefix="SCORER_",
         env_nested_delimiter="__",
         extra="ignore",
     )
 
+    _yaml_name: ClassVar[str] = "scorer"
+
     profiles: dict[str, dict[str, float]] = Field(default={})
+    normalize_profiles: bool = Field(default=True)
+    weight_sum_tolerance: float = Field(default=0.01, ge=0.0)
     preprocessing: _ScorerPreprocessing = Field(default_factory=_ScorerPreprocessing)
     detection: _ScorerDetection = Field(default_factory=_ScorerDetection)
     boundary: _ScorerBoundary = Field(default_factory=_ScorerBoundary)
@@ -119,99 +185,191 @@ class ScorerSettings(BaseSettings):
     )
     boost: _ScorerBoost = Field(default_factory=_ScorerBoost)
 
+    @model_validator(mode="after")
+    def _validateProfiles(self):
+        if not self.profiles:
+            return self
 
-class AudioSettings(BaseSettings):
+        # Imported lazily to avoid a settings → logger → settings cycle.
+        from src.util import FEATURE_NAMES
+
+        normalized: dict[str, dict[str, float]] = {}
+        for profileName, weights in self.profiles.items():
+            if not isinstance(weights, dict) or not weights:
+                raise ValueError(f"profile '{profileName}' must be a non-empty mapping")
+
+            unknown = set(weights) - FEATURE_NAMES
+            if unknown:
+                raise ValueError(
+                    f"profile '{profileName}' contains unknown feature key(s): "
+                    f"{sorted(unknown)}"
+                )
+            negative = [k for k, v in weights.items() if v < 0]
+            if negative:
+                raise ValueError(
+                    f"profile '{profileName}' contains negative weight(s): {negative}"
+                )
+
+            total = sum(weights.values())
+            if total <= 0:
+                raise ValueError(f"profile '{profileName}' weights must sum to > 0")
+            if self.normalize_profiles:
+                weights = {k: v / total for k, v in weights.items()}
+                total = 1.0
+            if abs(total - 1.0) > self.weight_sum_tolerance:
+                raise ValueError(
+                    f"profile '{profileName}' weights sum to {total:.3f}; "
+                    f"expected 1.0 ± {self.weight_sum_tolerance} "
+                    "(set SCORER_NORMALIZE_PROFILES=true to auto-normalize)"
+                )
+            normalized[profileName] = weights
+
+        self.profiles = normalized
+        return self
+
+
+class AudioSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="AUDIO_", extra="ignore")
 
-    sample_rate: int = Field(default=16000)
-    hop_length: int = Field(default=512)
-    frame_length: int = Field(default=2048)
-    n_mfcc: int = Field(default=13)
-    panns_rms_threshold: float = Field(default=2.0)
-    panns_hop_secs: float = Field(default=0.5)
-    panns_chunk_secs: float = Field(default=1.5)
-    panns_min_chunk_secs: float = Field(default=0.5)
-    panns_batch_size_gpu: int = Field(default=32)
-    panns_batch_size_cpu: int = Field(default=8)
-    min_trigger_gap_sec: int = Field(default=2)
-    event_laughter_idx: int = Field(default=32)
-    event_applause_idx: int = Field(default=10)
-    event_music_idx: int = Field(default=137)
+    _yaml_name: ClassVar[str] = "audio"
+
+    sample_rate: int = Field(default=16000, gt=0)
+    hop_length: int = Field(default=512, gt=0)
+    frame_length: int = Field(default=2048, gt=0)
+    n_mfcc: int = Field(default=13, ge=1)
+    panns_rms_threshold: float = Field(default=2.0, ge=0.0)
+    panns_hop_secs: float = Field(default=0.5, gt=0.0)
+    panns_chunk_secs: float = Field(default=1.5, gt=0.0)
+    panns_min_chunk_secs: float = Field(default=0.5, gt=0.0)
+    panns_batch_size_gpu: int = Field(default=32, ge=1)
+    panns_batch_size_cpu: int = Field(default=8, ge=1)
+    min_trigger_gap_sec: int = Field(default=2, ge=0)
+    event_laughter_idx: int = Field(default=32, ge=0)
+    event_applause_idx: int = Field(default=10, ge=0)
+    event_music_idx: int = Field(default=137, ge=0)
+
+    @model_validator(mode="after")
+    def _validateChunks(self):
+        if self.panns_min_chunk_secs > self.panns_chunk_secs:
+            raise ValueError("panns_min_chunk_secs must not exceed panns_chunk_secs")
+        return self
 
 
-class TextSettings(BaseSettings):
+class TextSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="TEXT_", extra="ignore")
 
-    similarity_threshold: float = Field(default=0.7)
-    utr_threshold: float = Field(default=0.3)
+    _yaml_name: ClassVar[str] = "text"
+
+    similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    utr_threshold: float = Field(default=0.3, gt=0.0, le=1.0)
     keyword_config_path: str = Field(default="config/keywords.json")
-    density_estimate_divisor: int = Field(default=10)
-    utr_penalty_max: float = Field(default=1.0)
-    userid_hash_len: int = Field(default=16)
+    density_estimate_divisor: int = Field(default=10, ge=1)
+    utr_penalty_max: float = Field(default=1.0, ge=0.0)
+    userid_hash_len: int = Field(default=16, ge=1)
     sentiment_model: str = Field(
         default="uer/roberta-base-finetuned-jd-binary-chinese"
     )
-    sentiment_max_len: int = Field(default=512)
-    fasttext_model_path: str = Field(default="models/cc.zh.100.bin")
+    sentiment_max_len: int = Field(default=512, gt=0)
+    fasttext_model_path: str = Field(default="models/cc.zh.300.bin")
     text2vec_model: str = Field(default="shibing624/text2vec-base-chinese")
-    utr_window_radius: int = Field(default=30)
-    entropy_window_radius: int = Field(default=5)
-    entropy_msg_cap: int = Field(default=200)
-    entropy_top_words: int = Field(default=50)
-    topic_window_size: int = Field(default=30)
-    topic_msg_cap: int = Field(default=50)
-    topic_kmeans_clusters_min: int = Field(default=2)
-    topic_kmeans_clusters_max: int = Field(default=5)
-    topic_kmeans_n_init: int = Field(default=10)
+    utr_window_radius: int = Field(default=30, ge=1)
+    entropy_window_radius: int = Field(default=5, ge=0)
+    entropy_msg_cap: int = Field(default=200, ge=1)
+    entropy_top_words: int = Field(default=50, ge=1)
+    topic_window_size: int = Field(default=30, ge=1)
+    topic_msg_cap: int = Field(default=50, ge=1)
+    topic_kmeans_clusters_min: int = Field(default=2, ge=1)
+    topic_kmeans_clusters_max: int = Field(default=5, ge=1)
+    topic_kmeans_n_init: int = Field(default=10, ge=1)
     topic_kmeans_random_state: int = Field(default=42)
 
+    @model_validator(mode="after")
+    def _validateClusters(self):
+        if self.topic_kmeans_clusters_min > self.topic_kmeans_clusters_max:
+            raise ValueError(
+                "topic_kmeans_clusters_min must not exceed topic_kmeans_clusters_max"
+            )
+        return self
 
-class VisualSettings(BaseSettings):
+
+class VisualSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="VISUAL_", extra="ignore")
 
-    scene_threshold: float = Field(default=27.0)
-    fps_fallback: int = Field(default=30)
+    _yaml_name: ClassVar[str] = "visual"
+
+    scene_threshold: float = Field(default=27.0, gt=0.0)
+    fps_fallback: int = Field(default=30, gt=0)
     opticalflow_resolution: tuple[int, int] = Field(default=(320, 240))
-    opticalflow_sample_interval: int = Field(default=5)
-    farneback_pyr_scale: float = Field(default=0.5)
-    farneback_levels: int = Field(default=3)
-    farneback_winsize: int = Field(default=15)
-    farneback_iterations: int = Field(default=3)
-    farneback_poly_n: int = Field(default=5)
-    farneback_poly_sigma: float = Field(default=1.2)
+    opticalflow_sample_interval: int = Field(default=5, ge=1)
+    farneback_pyr_scale: float = Field(default=0.5, gt=0.0, lt=1.0)
+    farneback_levels: int = Field(default=3, ge=1)
+    farneback_winsize: int = Field(default=15, ge=1)
+    farneback_iterations: int = Field(default=3, ge=1)
+    farneback_poly_n: int = Field(default=5, ge=1)
+    farneback_poly_sigma: float = Field(default=1.2, gt=0.0)
     farneback_flags: int = Field(default=0)
-    face_score_threshold: float = Field(default=0.6)
+    face_score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+
+    @field_validator("opticalflow_resolution")
+    @classmethod
+    def _validateResolution(cls, value: tuple[int, int]) -> tuple[int, int]:
+        if len(value) != 2 or any(v <= 0 for v in value):
+            raise ValueError("opticalflow_resolution must be a positive (width, height)")
+        return value
 
 
-class RecordingSettings(BaseSettings):
+class RecordingSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="RECORDER_", extra="ignore")
 
-    rotation_secs: int = Field(default=1800)
-    backoff_base: int = Field(default=2)
-    backoff_max: int = Field(default=30)
-    unexpected_retry_wait: int = Field(default=10)
-    max_retries: int = Field(default=5)
-    http_timeout_total: int | None = Field(default=None)
-    http_timeout_sock_read: float = Field(default=30.0)
-    chunk_size: int = Field(default=65536)
-    ws_ping_interval: float = Field(default=5.0)
-    ws_reconnect_delay: float = Field(default=3.0)
+    _yaml_name: ClassVar[str] = "recording"
+
+    rotation_secs: int = Field(default=1800, gt=0)
+    backoff_base: int = Field(default=2, ge=1)
+    backoff_max: int = Field(default=30, ge=1)
+    unexpected_retry_wait: int = Field(default=10, ge=0)
+    max_retries: int = Field(default=5, ge=0)
+    http_timeout_total: int | None = Field(default=None, gt=0)
+    http_timeout_sock_read: float = Field(default=30.0, gt=0.0)
+    chunk_size: int = Field(default=65536, gt=0)
+    ws_ping_interval: float = Field(default=5.0, gt=0.0)
+    ws_ping_timeout: float = Field(default=10.0, gt=0.0)
+    ws_reconnect_delay: float = Field(default=3.0, ge=0.0)
+    idle_timeout_secs: float = Field(default=60.0, gt=0.0)
+    min_free_disk_gb: float = Field(default=2.0, ge=0.0)
+    max_segment_bytes: int = Field(default=4 * 1024 ** 3, gt=0)
+    stale_part_max_age_secs: int = Field(default=86400, ge=0)
+
+    @model_validator(mode="after")
+    def _validateBackoff(self):
+        if self.backoff_max < self.backoff_base:
+            raise ValueError("backoff_max must be >= backoff_base")
+        return self
 
 
-class PipelineSettings(BaseSettings):
+class PipelineSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="PIPELINE_", extra="ignore")
 
-    sensitivity_default: float = Field(default=2.5)
-    min_duration_default: float = Field(default=15.0)
-    max_duration_default: float = Field(default=90.0)
+    _yaml_name: ClassVar[str] = "pipeline"
+
+    sensitivity_default: float = Field(default=2.5, gt=0.0)
+    min_duration_default: float = Field(default=15.0, gt=0.0)
+    max_duration_default: float = Field(default=90.0, gt=0.0)
     resolution_default: str = Field(default="720p")
-    ws_join_timeout: float = Field(default=3.0)
-    writer_join_timeout: float = Field(default=3.0)
-    queue_timeout: float = Field(default=0.5)
-    signal_pool_workers: int = Field(default=3)
-    ffmpeg_timeout_clip: int = Field(default=300)
-    ffmpeg_timeout_thumbnail: int = Field(default=60)
-    ffmpeg_timeout_burn: int = Field(default=300)
+    ws_join_timeout: float = Field(default=3.0, ge=0.0)
+    writer_join_timeout: float = Field(default=3.0, ge=0.0)
+    queue_timeout: float = Field(default=0.5, gt=0.0)
+    signal_pool_workers: int = Field(default=3, ge=1)
+    ffmpeg_timeout_clip: int = Field(default=300, gt=0)
+    ffmpeg_timeout_thumbnail: int = Field(default=60, gt=0)
+    ffmpeg_timeout_burn: int = Field(default=300, gt=0)
+
+    @model_validator(mode="after")
+    def _validateDurations(self):
+        if self.min_duration_default >= self.max_duration_default:
+            raise ValueError(
+                "min_duration_default must be smaller than max_duration_default"
+            )
+        return self
 
 
 # ── aggregate settings ───────────────────────────────────────────
@@ -229,24 +387,12 @@ class AppSettings(BaseSettings):
 
 # ── loader ───────────────────────────────────────────────────────
 
-def _load_section(name: str, cls: type) -> Any:
-    """Load a single section from its YAML file, then overlay env vars."""
-    yaml_path = _CONFIG_DIR / f"{name}.yaml"
-    yaml_data = _load_yaml(yaml_path)
-    return cls(**yaml_data)
-
-
 @lru_cache(maxsize=1)
 def load_settings() -> AppSettings:
     """Load all settings from config/*.yaml with environment overrides.
 
-    The result is cached; call ``load_settings.cache_clear()`` to force reload.
+    The result is cached; call ``load_settings.cache_clear()`` to force a
+    reload.  Note that modules which snapshot ``_cfg`` at import time still
+    need a process restart to pick up changes (see reload_settings()).
     """
-    return AppSettings(
-        scorer=_load_section("scorer", ScorerSettings),
-        audio=_load_section("audio", AudioSettings),
-        text=_load_section("text", TextSettings),
-        visual=_load_section("visual", VisualSettings),
-        recording=_load_section("recording", RecordingSettings),
-        pipeline=_load_section("pipeline", PipelineSettings),
-    )
+    return AppSettings()

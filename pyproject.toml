@@ -53,6 +53,16 @@ douyin-live = "src.controller:main"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra -q"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "models", "src/protobuf"]
+
+[tool.ruff.lint]
+# Start with the rules that catch real defects; expand once the baseline is clean.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.coverage.run]
 source = ["src"]

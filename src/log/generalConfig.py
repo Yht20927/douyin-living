@@ -10,7 +10,6 @@ For log-level at runtime, use ``--log-level`` CLI arg or call
 """
 
 from pathlib import Path
-from datetime import datetime
 
 
 class GeneralConfig:

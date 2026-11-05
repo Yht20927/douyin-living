@@ -1,12 +1,17 @@
-# Core dependencies (required for recording + clipping baseline)
+# Core dependencies — required for recording and the rule-based clipping pipeline.
+# AI / model dependencies live in requirements-ai.txt.
+aiofiles>=23.0
 aiohttp>=3.9
 httpx>=0.27
+loguru>=0.7
+numpy>=1.23
 protobuf>=5.0
-websockets>=12.0
-websocket-client>=1.6
+pydantic>=2.0
+pydantic-settings>=2.0
 PyExecJS>=1.5
 python-dotenv>=1.0
-loguru>=0.7
-scipy>=1.10
-numpy>=1.23
+PyYAML>=6.0
 scikit-image>=0.20
+scipy>=1.10
+websocket-client>=1.6
+websockets>=12.0

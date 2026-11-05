@@ -4,7 +4,6 @@
 import json
 import subprocess
 import os
-from pathlib import Path
 from src.log.logger import getLogger
 from src.util import fmtSize, fmtSrtTime
 
@@ -76,7 +75,7 @@ def clipVideo(
             log.info(f"[DRY RUN] {' '.join(cmd)}")
         else:
             try:
-                result = subprocess.run(
+                subprocess.run(
                     cmd, check=True,
                     capture_output=True, text=True,
                     timeout=300,
@@ -132,7 +131,7 @@ def burnSubtitles(
         except subprocess.CalledProcessError as e:
             log.warning(f"Subtitle burn failed: {e.stderr.strip()[:200] if e.stderr else 'unknown'}")
         except subprocess.TimeoutExpired:
-            log.warning(f"Subtitle burn timeout: ffmpeg hung for >300s")
+            log.warning("Subtitle burn timeout: ffmpeg hung for >300s")
 
 
 def generateClipSrt(

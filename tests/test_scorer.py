@@ -2,7 +2,6 @@
 """Unit tests for the scorer module."""
 
 import numpy as np
-import pytest
 
 from src.scorer import (
     _detectPeaks,
@@ -95,17 +94,21 @@ class TestNMS:
 class TestQualityFilter:
     """Tests for _qualityFilter — duration bounds + t-test."""
 
-    def test_too_short_clip_filtered(self):
-        clips = [(0.0, 5.0, 0.8)]  # 5s < minDur=15
+    def test_too_short_clip_expanded(self):
+        clips = [(0.0, 5.0, 0.8)]  # 5s < minDur=15 → expand around peak
         score = np.ones(100, dtype=np.float64)
         result = _qualityFilter(clips, minDur=15.0, maxDur=90.0, score=score, nSecs=100)
-        assert len(result) == 0
+        assert len(result) == 1
+        start, end, _ = result[0]
+        assert end - start == 15.0
 
-    def test_too_long_clip_filtered(self):
-        clips = [(0.0, 95.0, 0.8)]  # 95s > maxDur=90
+    def test_too_long_clip_trimmed(self):
+        clips = [(0.0, 95.0, 0.8)]  # 95s > maxDur=90 → keep best sub-window
         score = np.ones(100, dtype=np.float64)
         result = _qualityFilter(clips, minDur=15.0, maxDur=90.0, score=score, nSecs=100)
-        assert len(result) == 0
+        assert len(result) == 1
+        start, end, _ = result[0]
+        assert end - start == 90.0
 
     def test_valid_duration_kept(self):
         clips = [(20.0, 50.0, 0.8)]  # 30s ∈ [15, 90]
@@ -114,14 +117,20 @@ class TestQualityFilter:
         result = _qualityFilter(clips, minDur=15.0, maxDur=90.0, score=score, nSecs=100)
         assert len(result) == 1
 
-    def test_t_test_rejects_insignificant(self):
-        """Clip with statistically insignificant difference should be rejected."""
+    def test_t_test_penalizes_insignificant(self):
+        """Statistically weak clips are kept but downgraded, not dropped."""
         clips = [(60.0, 75.0, 0.8)]
         rng = np.random.RandomState(99)
         score = rng.normal(loc=1.0, scale=0.5, size=100).astype(np.float64)
-        # Clip region has same distribution → t-test p > 0.05 → rejected
-        result = _qualityFilter(clips, minDur=15.0, maxDur=90.0, score=score, nSecs=100)
-        assert len(result) == 0
+        adjustments = []
+        # Clip region has same distribution → t-test p > 0.05 → score penalty
+        result = _qualityFilter(
+            clips, minDur=15.0, maxDur=90.0, score=score, nSecs=100,
+            adjustments=adjustments,
+        )
+        assert len(result) == 1
+        assert result[0][2] < 0.8
+        assert any(a["reason"] == "t_test_insignificant" for a in adjustments)
 
 
 class TestPreprocess:

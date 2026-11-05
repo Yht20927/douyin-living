@@ -1,0 +1,23 @@
+# Keep the build context small and avoid leaking local state into the image.
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+htmlcov
+data
+logs
+models
+docs
+tests
+node_modules
+.env
+cookie.txt
+status.txt
+*.flv
+*.jsonl
+*.aac
+*.mp3

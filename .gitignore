@@ -1,21 +1,33 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-*.egg-info
 dist/
 build/
 .venv/
 venv/
+
+# Local configuration / secrets
 .env
+cookie.txt
+status.txt
+
+# Runtime output
+data/
+logs/
 *.flv
 *.jsonl
 *.aac
 *.mp3
-node_modules/
-logs/
+
+# Downloaded model assets (optional, large)
+models/*
+!models/.gitkeep
+
+# Tooling caches
 .pytest_cache/
-data/
-.*/
 .coverage
-cookie.txt
-status.txt
+htmlcov/
+node_modules/
+.*/
+!.github/

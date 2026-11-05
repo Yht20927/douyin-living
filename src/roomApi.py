@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
 """Room API — douyin live room info and stream URLs."""
 
-import re
-import json
+import asyncio
+import random
+import threading
 from typing import Any
 import httpx
 from src.log.logger import getLogger
 from src.util import transCookies
+from src.douyin.room_parser import (
+    extractRoomInfo,
+    extractStreamUrls,
+    extractStreamUrlsFromJson,
+)
 
 log = getLogger(__name__)
+
+MAX_ATTEMPTS = 3
+BACKOFF_BASE_SECS = 0.5
+BACKOFF_MAX_SECS = 8.0
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 HEADERS_PC = {
     "User-Agent": (
@@ -23,16 +34,81 @@ HEADERS_PC = {
 # Module-level shared client — initialised once at import time so we
 # never block the event loop inside an async function with a lock.
 _client: httpx.AsyncClient | None = None
+_clientLock = threading.Lock()
 
 
 def _get_client() -> httpx.AsyncClient:
     """Return the module-level shared httpx client, creating it if needed."""
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0), follow_redirects=True
-        )
+        with _clientLock:
+            if _client is None:
+                _client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(15.0), follow_redirects=True
+                )
     return _client
+
+
+async def _sleepBackoff(seconds: float) -> None:
+    """Sleep helper kept separate so tests can patch retry delays."""
+    await asyncio.sleep(seconds)
+
+
+def _retryDelay(attempt: int) -> float:
+    """Exponential backoff with jitter for transient HTTP failures."""
+    base = min(BACKOFF_BASE_SECS * (2 ** (attempt - 1)), BACKOFF_MAX_SECS)
+    return base + random.uniform(0, base * 0.25)
+
+
+async def _request(url: str, **kwargs) -> httpx.Response:
+    """GET with retry/backoff for 429 and 5xx responses.
+
+    Cookie failures (401/403) are not retried; they log a clear hint so the
+    operator knows to refresh ``cookie.txt``.
+    """
+    client = _get_client()
+    lastError: Exception | None = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            resp = await client.get(url, **kwargs)
+        except httpx.TransportError as exc:
+            lastError = exc
+            if attempt >= MAX_ATTEMPTS:
+                break
+            delay = _retryDelay(attempt)
+            log.warning(
+                f"HTTP transport error (attempt {attempt}/{MAX_ATTEMPTS}), "
+                f"retrying in {delay:.2f}s: {exc}"
+            )
+            await _sleepBackoff(delay)
+            continue
+
+        status = getattr(resp, "status_code", 200)
+        if status in (401, 403):
+            log.warning(
+                f"HTTP {status} from live.douyin.com — Cookie may be expired "
+                "or invalid; refresh cookie.txt and retry"
+            )
+        if status in RETRY_STATUSES:
+            lastError = httpx.HTTPStatusError(
+                f"transient HTTP {status}", request=None, response=resp  # type: ignore[arg-type]
+            )
+            if attempt < MAX_ATTEMPTS:
+                delay = _retryDelay(attempt)
+                log.warning(
+                    f"HTTP {status} (attempt {attempt}/{MAX_ATTEMPTS}), "
+                    f"retrying in {delay:.2f}s"
+                )
+                await _sleepBackoff(delay)
+                continue
+            log.error(f"HTTP {status} after {MAX_ATTEMPTS} attempts")
+        resp.raise_for_status()
+        return resp
+
+    if lastError is not None:
+        raise lastError
+    raise RuntimeError("request failed without an exception")
 
 
 class RoomApi:
@@ -63,8 +139,6 @@ class RoomApi:
         url = f"https://live.douyin.com/{webRid}"
         headers = dict(HEADERS_PC)
 
-        client = _get_client()
-
         # Pass cookies as dict (httpx format), not as header string
         cookies = None
         if hasattr(auth, "cookie") and auth.cookie:
@@ -72,8 +146,9 @@ class RoomApi:
         elif hasattr(auth, "cookieStr") and auth.cookieStr:
             cookies = transCookies(auth.cookieStr)
 
-        resp = await client.get(url, headers=headers, cookies=cookies, follow_redirects=True)
-        resp.raise_for_status()
+        resp = await _request(
+            url, headers=headers, cookies=cookies, follow_redirects=True
+        )
         html = resp.text
 
         # Extract ttwid from response cookies
@@ -84,7 +159,7 @@ class RoomApi:
                 break
 
         # Extract room info from SSR data in the page
-        result = _extractRoomInfo(html, webRid)
+        result = extractRoomInfo(html, webRid)
         if ttwid:
             result["ttwid"] = ttwid
 
@@ -145,7 +220,7 @@ class RoomApi:
             ),
             "Accept": "application/x-protobuf",
             "Origin": "https://live.douyin.com",
-            "Referer": referer or f"https://live.douyin.com/",
+            "Referer": referer or "https://live.douyin.com/",
         }
 
         # Add CSRF token if available
@@ -159,9 +234,13 @@ class RoomApi:
         elif hasattr(auth, "cookieStr") and auth.cookieStr:
             cookies = transCookies(auth.cookieStr)
 
-        client = _get_client()
-        resp = await client.get(url, params=p.toDict(), headers=headers, cookies=cookies, follow_redirects=True)
-        resp.raise_for_status()
+        resp = await _request(
+            url,
+            params=p.toDict(),
+            headers=headers,
+            cookies=cookies,
+            follow_redirects=True,
+        )
         log.debug(f"Webcast detail: {len(resp.content)} bytes")
         return resp.content
 
@@ -180,45 +259,52 @@ class RoomApi:
         url = f"https://live.douyin.com/{webRid}"
         headers = dict(HEADERS_PC)
 
-        client = _get_client()
         cookies = None
         if hasattr(auth, "cookie") and auth.cookie:
             cookies = auth.cookie
+        elif hasattr(auth, "cookieStr") and auth.cookieStr:
+            cookies = transCookies(auth.cookieStr)
 
-        resp = await client.get(url, headers=headers, cookies=cookies, follow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Find script tags with FLV URLs
-        scripts = re.findall(r"<script[^>]*nonce[^>]*>(.*?)</script>", html, re.DOTALL)
         result: dict[str, str] = {}
-
-        for scriptContent in scripts:
-            if "pull-flv" not in scriptContent:
-                continue
-
-            # First, decode all unicode escapes in the script content
-            decoded = scriptContent
-            # Replace \u0026 → &, \u002F → /, \u003D → =, etc.
-            decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
-            decoded = decoded.replace("\\/", "/")
-
-            # Match signed FLV URLs — capture full URL including all query params
-            # Pattern: http(s)://pull-flv-{cdn}/third/stream-{id}_{quality}.flv?params...
-            # The URL ends at the next unescaped double-quote
-            matches = re.findall(
-                r'(https?://pull-flv[^"]+?'
-                r'(?:stream-[\d]+)_(or4|hd|sd|ld|md)\.flv'
-                r'\?[^"]+)',
-                decoded
+        html = ""
+        try:
+            resp = await _request(
+                url, headers=headers, cookies=cookies, follow_redirects=True
             )
-            for fullUrl, quality in matches:
-                result[quality] = fullUrl
+            html = resp.text
+            result = extractStreamUrls(html)
+        except httpx.HTTPError as exc:
+            log.warning(
+                f"Live page fetch failed ({type(exc).__name__}: {exc}); "
+                "trying enterRoom API"
+            )
 
-            if result:
-                break
+        if result:
+            log.info(f"Extracted {len(result)} FLV URLs: {list(result.keys())}")
+            return result
 
-        log.info(f"Extracted {len(result)} FLV URLs: {list(result.keys())}")
+        roomId = ""
+        if html:
+            roomInfo = extractRoomInfo(html, webRid)
+            roomId = roomInfo.get("roomId", "")
+
+        try:
+            payload = await RoomApi.enterRoom(auth, webRid, roomId)
+            result = extractStreamUrlsFromJson(payload)
+        except httpx.HTTPError as exc:
+            log.warning(
+                f"enterRoom fallback failed ({type(exc).__name__}: {exc})"
+            )
+        except Exception:
+            log.exception("enterRoom fallback failed unexpectedly")
+
+        if result:
+            log.info(
+                f"enterRoom fallback extracted {len(result)} FLV URLs: "
+                f"{list(result.keys())}"
+            )
+        else:
+            log.warning("No FLV URLs found in page SSR or enterRoom API")
         return result
 
     @staticmethod
@@ -253,69 +339,15 @@ class RoomApi:
         if hasattr(auth, "cookie") and auth.cookie:
             cookies = auth.cookie
 
-        client = _get_client()
-        resp = await client.get(url, headers=headers, cookies=cookies, follow_redirects=True)
-        resp.raise_for_status()
+        resp = await _request(
+            url, headers=headers, cookies=cookies, follow_redirects=True
+        )
         return resp.json()
 
 
 # ── internal helpers ──────────────────────────────────────────────
 
 def _extractRoomInfo(html: str, webRid: str) -> dict[str, str]:
-    """Parse room info from the live page HTML.
+    """Backward-compatible wrapper around :func:`extractRoomInfo`."""
+    return extractRoomInfo(html, webRid)
 
-    Uses the same regex patterns as Douyin_Spider's get_live_info.
-    The key data is embedded in script tags with escaped JSON.
-    """
-    result: dict[str, str] = {
-        "roomId": "", "userId": "", "userUniqueId": "",
-        "anchorId": "", "secUid": "", "ttwid": "",
-        "roomStatus": "", "roomTitle": "",
-    }
-
-    # Find script tags with nonce attribute (contains SSR data)
-    scripts = re.findall(r'<script[^>]*nonce[^>]*>(.*?)</script>', html, re.DOTALL)
-    if not scripts:
-        # Fallback: find all script tags
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-
-    for scriptContent in scripts:
-        if not scriptContent or 'roomId' not in scriptContent:
-            continue
-
-        try:
-            # Regex patterns from Douyin_Spider (note: double-escaped quotes)
-            userIdMatches = re.findall(r'\\"user_unique_id\\":\\"(\d+)\\"', scriptContent)
-            roomIdMatches = re.findall(r'\\"roomId\\":\\"(\d+)\\"', scriptContent)
-            userUniqueIdMatches = re.findall(r'\\"user_unique_id\\":\\"(\d+)\\"', scriptContent)
-
-            # Room info: status + title
-            roomInfoMatches = re.findall(
-                r'\\"roomInfo\\":\{\\"room\\":\{\\"id_str\\":\\".*?\\",\\"status\\":(.*?),\\"status_str\\":\\".*?\\",\\"title\\":\\"(.*?)\\"',
-                scriptContent
-            )
-
-            anchorMatches = re.findall(r'\\"anchor\\":\{\\"id_str\\":\\"(\d+)\\"', scriptContent)
-            secUidMatches = re.findall(r'\\"sec_uid\\":\\"(.*?)\\"', scriptContent)
-
-            if roomIdMatches:
-                result["roomId"] = roomIdMatches[0]
-            if userIdMatches:
-                result["userId"] = userIdMatches[0]
-            if userUniqueIdMatches:
-                result["userUniqueId"] = userUniqueIdMatches[0]
-            if roomInfoMatches:
-                result["roomStatus"] = roomInfoMatches[0][0]
-                result["roomTitle"] = roomInfoMatches[0][1]
-            if anchorMatches:
-                result["anchorId"] = anchorMatches[0]
-            if secUidMatches:
-                result["secUid"] = secUidMatches[0]
-
-            # If we got roomId, we're done
-            if result["roomId"]:
-                break
-        except Exception:
-            continue
-
-    return result

@@ -8,7 +8,6 @@ checks elsewhere.
 
 import os
 import tempfile
-import pytest
 
 from src.clipper import generateClipSrt
 

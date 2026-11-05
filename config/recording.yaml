@@ -7,4 +7,9 @@ http_timeout_total: null
 http_timeout_sock_read: 30.0
 chunk_size: 65536
 ws_ping_interval: 5.0
+ws_ping_timeout: 10.0
 ws_reconnect_delay: 3.0
+idle_timeout_secs: 60.0
+min_free_disk_gb: 2.0
+max_segment_bytes: 4294967296
+stale_part_max_age_secs: 86400

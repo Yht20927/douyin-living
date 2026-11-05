@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for FlvRecorder — URL fallback, stats, properties."""
 
-import os
 import pytest
-import asyncio
 from src.flvRecorder import FlvRecorder
 from src.models import StreamInfo
 

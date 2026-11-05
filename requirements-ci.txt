@@ -1,0 +1,6 @@
+# CI-only dependencies: base + dev + lightweight vision tests.
+# Deliberately excludes torch/ASR/NLP models so PR jobs stay fast.
+-r requirements.txt
+-r requirements-dev.txt
+scenedetect>=0.6
+opencv-python-headless>=4.8

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for _extractRoomInfo — SSR HTML parsing."""
 
-import pytest
 from src.roomApi import _extractRoomInfo
 
 

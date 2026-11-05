@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for src.util — formatting + cookie + feature validation."""
 
-import pytest
 
 from src.util import (
     fmtSize,

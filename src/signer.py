@@ -8,7 +8,6 @@ X-Bogus (live danmaku): MD5 + JS signature (dyLiveSign.js via PyExecJS).
 
 import hashlib
 import random
-import string
 import threading
 import execjs
 from pathlib import Path

@@ -2,7 +2,6 @@
 """Tests for logger module — getLogger, setLogLevel thread safety."""
 
 import threading
-import pytest
 from src.log.logger import getLogger, setLogLevel, LoggerManager
 
 

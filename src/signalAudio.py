@@ -3,7 +3,12 @@
 
 import json
 import numpy as np
-import librosa
+
+try:
+    import librosa
+except ImportError:  # optional AI dependency; reported at extraction time
+    librosa = None
+
 from src.log.logger import getLogger
 from src.config import load_settings
 
@@ -20,10 +25,20 @@ EVENT_NAMES = ["laughter", "applause", "music"]
 PANNS_RMS_THRESHOLD = _cfg.panns_rms_threshold
 
 
+def _fit1Hz(values: list[float], target: int, padValue: float = 0.0) -> list[float]:
+    """Fit a 1 Hz feature array to an expected timeline length."""
+    if target <= 0 or len(values) == target:
+        return values
+    if len(values) > target:
+        return values[:target]
+    return values + [padValue] * (target - len(values))
+
+
 def extractFeatures(
     audioPath: str,
     sr: int | None = None,
     outputPath: str | None = None,
+    durationSec: float | None = None,
 ) -> dict:
     """Extract audio features from an audio file.
 
@@ -31,20 +46,27 @@ def extractFeatures(
         audioPath: Path to AAC/MP3/WAV audio file.
         sr: Sample rate for librosa (16kHz balances quality and speed).
         outputPath: If set, save features JSON to this path.
+        durationSec: Authoritative timeline length (usually video duration).
+            When provided, arrays are fitted to this 1 Hz length so every
+            signal source shares the same timeline.
 
     Returns:
-        dict with 'sampleRate', 'duration', 'features' keys.
+        dict with 'sampleRate', 'duration', 'features', 'status' keys.
     """
     log.info(f"Extracting audio features: {audioPath}")
     try:
-        return _extractFeaturesImpl(audioPath, sr, outputPath)
-    except Exception:
+        return _extractFeaturesImpl(audioPath, sr, outputPath, durationSec)
+    except Exception as exc:
         log.exception(f"Audio feature extraction failed for {audioPath}")
         # Return an empty feature structure so the pipeline can continue
         # with other signal sources instead of crashing entirely.
         empty = {
             "sampleRate": 1,
             "duration": 0,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "generatorVersion": "signalAudio/2",
+            "featureCount": 0,
             "features": {
                 "rms": [], "spectralCentroid": [], "mfccDist": [],
                 "zcr": [], "eventLaughter": [], "eventApplause": [], "eventMusic": [],
@@ -60,12 +82,20 @@ def _extractFeaturesImpl(
     audioPath: str,
     sr: int | None = None,
     outputPath: str | None = None,
+    durationSec: float | None = None,
 ) -> dict:
     """Inner implementation — wrapped by extractFeatures with try/except."""
+    if librosa is None:
+        raise RuntimeError(
+            "librosa is not installed; run: pip install -r requirements-ai.txt"
+        )
     sr = sr or _cfg.sample_rate
     y, sr = librosa.load(audioPath, sr=sr, mono=True)
-    duration = librosa.get_duration(y=y, sr=sr)
-    nSecs = int(np.ceil(duration))
+    audioDuration = librosa.get_duration(y=y, sr=sr)
+    nSecs = int(np.ceil(audioDuration))
+    expectedSecs = (
+        int(np.ceil(durationSec)) if durationSec and durationSec > 0 else nSecs
+    )
 
     # ── Frame-level features (librosa frame rate) ────────────────
     hop_length = _cfg.hop_length
@@ -187,19 +217,36 @@ def _extractFeaturesImpl(
     else:
         log.debug("No significant RMS peaks — skipping panns (saves ~2s)")
 
+    # ── Align to expected timeline ─────────────────────────────
+    # Continuous signals repeat their edge value; event signals are padded
+    # with zeros so missing tail audio never invents laughter/applause.
+    featureDict = {
+        "rms": _fit1Hz(rms1Hz, expectedSecs, rms1Hz[-1] if rms1Hz else 0.0),
+        "spectralCentroid": _fit1Hz(
+            centroid1Hz, expectedSecs, centroid1Hz[-1] if centroid1Hz else 0.0
+        ),
+        "mfccDist": _fit1Hz(
+            mfccDist1Hz, expectedSecs, mfccDist1Hz[-1] if mfccDist1Hz else 0.0
+        ),
+        "zcr": _fit1Hz(zcr1Hz, expectedSecs, zcr1Hz[-1] if zcr1Hz else 0.0),
+        "eventLaughter": _fit1Hz(eventLaughter, expectedSecs, 0.0),
+        "eventApplause": _fit1Hz(eventApplause, expectedSecs, 0.0),
+        "eventMusic": _fit1Hz(eventMusic, expectedSecs, 0.0),
+    }
+
     # ── Build output ───────────────────────────────────────────
     features = {
         "sampleRate": 1,
-        "duration": duration,
-        "features": {
-            "rms": rms1Hz,
-            "spectralCentroid": centroid1Hz,
-            "mfccDist": mfccDist1Hz,
-            "zcr": zcr1Hz,
-            "eventLaughter": eventLaughter,
-            "eventApplause": eventApplause,
-            "eventMusic": eventMusic,
+        "duration": expectedSecs,
+        "status": "ok" if any(featureDict.values()) else "empty",
+        "generatorVersion": "signalAudio/2",
+        "featureCount": sum(1 for values in featureDict.values() if values),
+        "stats": {
+            "audioDurationSec": round(float(audioDuration), 3),
+            "durationSource": "explicit" if durationSec else "audio",
+            "pannsTriggers": triggerCount,
         },
+        "features": featureDict,
     }
 
     if outputPath:
@@ -207,5 +254,5 @@ def _extractFeaturesImpl(
             json.dump(features, f, ensure_ascii=False)
         log.info(f"Audio features saved: {outputPath}")
 
-    log.info(f"Audio features: {nSecs}s, {len(list(features['features'].keys()))} features")
+    log.info(f"Audio features: {expectedSecs}s, {features['featureCount']} non-empty features")
     return features

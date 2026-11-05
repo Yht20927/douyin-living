@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Integration tests for Controller lifecycle — start/stop with mocks."""
 
-import os
 import json
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -202,3 +201,89 @@ class TestControllerLifecycle:
         from collections import deque
         assert isinstance(ctrl._danmakuMessages, deque)
         assert ctrl._danmakuMessages.maxlen == 1000
+
+
+class TestRecordingMeta:
+    """recording_meta.json must reflect probed media, not wall-clock guesses."""
+
+    def test_write_recording_meta_uses_probe_and_monotonic_clock(self, tmp_path, monkeypatch):
+        import asyncio
+        from datetime import datetime, timezone
+
+        from src.controller import Controller
+
+        video = tmp_path / "room_merged.mp4"
+        audio = tmp_path / "room_audio.m4a"
+        video.write_bytes(b"fake-video")
+        audio.write_bytes(b"fake-audio")
+
+        def fake_probe(path):
+            return {
+                "durationSec": 123.4,
+                "videoDurationSec": 123.4,
+                "audioDurationSec": 0.0,
+                "format": "mp4",
+            }
+
+        monkeypatch.setattr("src.controller.probeMedia", fake_probe)
+
+        ctrl = Controller("room", outputDir=str(tmp_path))
+        ctrl._recordStartTime = 1_700_000_000.0
+        ctrl._recordStartMono = 555.0
+        firstDataAt = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+        recorder = MagicMock()
+        recorder.firstDataAt = firstDataAt
+        ctrl._flvRecorder = recorder
+
+        meta = asyncio.run(
+            ctrl._writeRecordingMeta(str(video), str(audio), [str(video)])
+        )
+
+        assert meta.videoDurationSec == 123.4
+        assert meta.audioDurationSec == 123.4  # falls back to video probe
+        assert meta.firstVideoDataAt == firstDataAt.isoformat()
+        assert meta.startedAtWall == "2023-11-14T22:13:20+00:00"
+        assert meta.startedAtMonotonic == 555.0
+        assert meta.segments == [str(video)]
+        assert str(video) in meta.sourceHashes
+        assert meta.sourceHashes[str(video)]["sha256"]
+
+        saved = json.loads((tmp_path / "recording_meta.json").read_text())
+        assert saved["videoDurationSec"] == 123.4
+        assert saved["sourceHashes"][str(video)]["sizeBytes"] == len(b"fake-video")
+
+    def test_write_recording_meta_preserves_existing_clock(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from src.controller import Controller
+        from src.contracts import RecordingMeta
+
+        video = tmp_path / "room_merged.mp4"
+        video.write_bytes(b"fake-video")
+        existing = RecordingMeta(
+            roomId="room",
+            startedAtWall="2023-01-01T00:00:00+00:00",
+            startedAtMonotonic=42.0,
+            firstVideoDataAt="2023-01-01T00:00:01+00:00",
+        )
+        existing.save(str(tmp_path / "recording_meta.json"))
+
+        monkeypatch.setattr(
+            "src.controller.probeMedia",
+            lambda path: {"durationSec": 10.0, "videoDurationSec": 10.0},
+        )
+
+        ctrl = Controller("room", outputDir=str(tmp_path))
+        # No live recorder and no fresh clock values — existing metadata wins.
+        ctrl._flvRecorder = None
+        ctrl._recordStartTime = 0.0
+        ctrl._recordStartMono = 0.0
+
+        meta = asyncio.run(
+            ctrl._writeRecordingMeta(str(video), None, [])
+        )
+
+        assert meta.startedAtWall == "2023-01-01T00:00:00+00:00"
+        assert meta.startedAtMonotonic == 42.0
+        assert meta.firstVideoDataAt == "2023-01-01T00:00:01+00:00"
+        assert meta.audioDurationSec == 0.0

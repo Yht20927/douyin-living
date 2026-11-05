@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for Signer — msToken, webId generation."""
 
-import pytest
 from src.signer import Signer
 
 

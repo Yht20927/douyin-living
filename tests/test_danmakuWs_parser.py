@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for DanmakuWs._parseMessage — protobuf message parsing."""
 
-import pytest
 from unittest.mock import MagicMock, patch
 from src.danmakuWs import DanmakuWs
 

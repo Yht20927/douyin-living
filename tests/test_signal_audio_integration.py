@@ -3,7 +3,6 @@
 
 import json
 import numpy as np
-import pytest
 
 
 class TestSignalAudioIntegration:

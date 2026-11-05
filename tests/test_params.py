@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for Params — query parameter builder."""
 
-import pytest
 from src.params import Params
 
 

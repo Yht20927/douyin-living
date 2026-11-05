@@ -72,11 +72,14 @@ def _stub_modules(monkeypatch, tmp_path):
     fasttext_stub.load_model = lambda path: _StubFastTextModel()
     monkeypatch.setitem(sys.modules, "fasttext", fasttext_stub)
 
-    # FastText only loads if cc.zh.100.bin exists on disk — touch it.
+    # FastText only loads if the configured model file exists on disk.
     # The factory ignores the file's contents so an empty file is fine.
-    bin_path = Path("cc.zh.100.bin")
+    projectRoot = Path(__file__).resolve().parents[1]
+    configured = Path(signalText._cfg.fasttext_model_path)
+    bin_path = configured if configured.is_absolute() else projectRoot / configured
     created = False
     if not bin_path.exists():
+        bin_path.parent.mkdir(parents=True, exist_ok=True)
         bin_path.touch()
         created = True
 

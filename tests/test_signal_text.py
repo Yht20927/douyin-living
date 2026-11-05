@@ -7,19 +7,22 @@ caused trouble: keyword fuzzy match, UTR sliding window, entropy, and
 second derivative.
 """
 
-import json
 import numpy as np
 import pytest
 
+import src.signalText as signalText
 from src.signalText import (
-    _fuzzyMatch,
     _fuzzyMatchCached,
     _computeUtr,
     _computeEntropyWindow,
+    _computeTopicChange,
+    _fastSentiment,
     _secondDerivative,
     _parseTimestamp,
     _getContent,
     _getUserId,
+    _resolveDuration,
+    POOL_NAME_TEXT2VEC,
     SIMILARITY_THRESHOLD,
 )
 
@@ -172,6 +175,52 @@ class TestEntryHelpers:
         assert _getUserId({"userId": "abc"}) != _getUserId({"userId": "xyz"})
 
 
+class TestResolveDuration:
+    """The text timeline must come from real media, not ``len(danmaku)//10``."""
+
+    def test_explicit_duration_wins(self):
+        assert _resolveDuration(
+            120.0,
+            [{"end": 30.0}],
+            [{"recvTimeSec": 90.0}],
+        ) == 120.0
+
+    def test_asr_end_used_without_explicit_duration(self):
+        assert _resolveDuration(
+            None,
+            [{"end": 12.5}, {"end": 47.0}, {"end": None}],
+            [],
+        ) == 47.0
+
+    def test_max_danmaku_timestamp_used(self):
+        assert _resolveDuration(
+            None,
+            [],
+            [{"recvTimeSec": 3.0}, {"timestamp": 61.5}, {"_time": 20.0}],
+        ) == 61.5
+
+    def test_longest_source_wins(self):
+        assert _resolveDuration(
+            None,
+            [{"end": 15.0}],
+            [{"recvTimeSec": 80.0}],
+        ) == 80.0
+
+    def test_invalid_values_ignored(self):
+        assert _resolveDuration(
+            None,
+            [{"end": "bad"}, {"end": None}],
+            [{"recvTimeSec": "bad"}, {}],
+        ) == 0.0
+
+    def test_empty_sources_return_zero(self):
+        assert _resolveDuration(None, [], []) == 0.0
+
+    def test_zero_or_negative_explicit_duration_falls_back(self):
+        assert _resolveDuration(0, [{"end": 9.0}], []) == 9.0
+        assert _resolveDuration(-5, [], [{"recvTimeSec": 9.0}]) == 9.0
+
+
 class TestSimilarityThreshold:
     """Lock the threshold default — bumping it silently breaks recall."""
 
@@ -179,3 +228,129 @@ class TestSimilarityThreshold:
         # Code paths use SIMILARITY_THRESHOLD; if anyone bumps it, this
         # test forces an explicit code review.
         assert SIMILARITY_THRESHOLD == 0.7
+
+
+class TestFastSentiment:
+    def test_empty_words_returns_zero(self):
+        assert _fastSentiment([]) == 0.0
+
+    def test_rule_fallback_positive(self, monkeypatch):
+        monkeypatch.setattr(signalText, "_sentimentAvailable", False)
+        monkeypatch.setattr(signalText, "_sentimentPipeline", None)
+        assert _fastSentiment(["哈哈", "真", "好"]) == 0.5
+
+    def test_rule_fallback_negative(self, monkeypatch):
+        monkeypatch.setattr(signalText, "_sentimentAvailable", False)
+        monkeypatch.setattr(signalText, "_sentimentPipeline", None)
+        assert _fastSentiment(["无语", "翻车"]) == -0.5
+
+    def test_rule_fallback_neutral(self, monkeypatch):
+        monkeypatch.setattr(signalText, "_sentimentAvailable", False)
+        monkeypatch.setattr(signalText, "_sentimentPipeline", None)
+        assert _fastSentiment(["今天", "天气"]) == 0.0
+
+    def test_pipeline_positive_and_negative(self, monkeypatch):
+        monkeypatch.setattr(signalText, "_sentimentAvailable", True)
+
+        class Pipeline:
+            def __init__(self, label):
+                self.label = label
+
+            def __call__(self, text):
+                return [{"label": self.label, "score": 0.9}]
+
+        monkeypatch.setattr(signalText, "_sentimentPipeline", Pipeline("POSITIVE"))
+        assert _fastSentiment(["哈哈"]) == 0.9
+        monkeypatch.setattr(signalText, "_sentimentPipeline", Pipeline("NEGATIVE"))
+        assert _fastSentiment(["哈哈"]) == -0.9
+
+    def test_pipeline_failure_falls_back_to_rules(self, monkeypatch):
+        monkeypatch.setattr(signalText, "_sentimentAvailable", True)
+
+        def broken(text):
+            raise RuntimeError("inference failed")
+
+        monkeypatch.setattr(signalText, "_sentimentPipeline", broken)
+        assert _fastSentiment(["哈哈"]) == 0.5
+
+
+class TestComputeTopicChange:
+    def _installFakeDeps(self, monkeypatch, encode=None, labels=None):
+        import sys
+        import types
+
+        class FakeSentenceModel:
+            def __init__(self, name):
+                self.name = name
+
+            def encode(self, texts):
+                if encode is not None:
+                    return encode(texts)
+                return np.array([[1.0, 0.0] for _ in texts])
+
+        class FakeKMeans:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def fit_predict(self, embeddings):
+                if labels is not None:
+                    return np.array(labels)
+                return np.zeros(len(embeddings), dtype=int)
+
+        text2vecModule = types.ModuleType("text2vec")
+        text2vecModule.SentenceModel = FakeSentenceModel
+        sklearnModule = types.ModuleType("sklearn")
+        clusterModule = types.ModuleType("sklearn.cluster")
+        clusterModule.KMeans = FakeKMeans
+        sklearnModule.cluster = clusterModule
+        monkeypatch.setitem(sys.modules, "text2vec", text2vecModule)
+        monkeypatch.setitem(sys.modules, "sklearn", sklearnModule)
+        monkeypatch.setitem(sys.modules, "sklearn.cluster", clusterModule)
+
+    def test_cluster_change_marks_transition(self, monkeypatch):
+        self._installFakeDeps(monkeypatch, labels=[0, 1])
+        allText = [[f"topic{i // 30}"] for i in range(60)]
+        result = _computeTopicChange(allText, 60)
+        assert sum(result) == 1
+        assert result[30] == 1
+
+    def test_requires_two_non_empty_windows(self, monkeypatch):
+        self._installFakeDeps(monkeypatch)
+        allText = [[""] for _ in range(60)]
+        assert _computeTopicChange(allText, 60) == [0] * 60
+
+    def test_empty_embeddings_returns_zero(self, monkeypatch):
+        self._installFakeDeps(monkeypatch, encode=lambda texts: [])
+        allText = [[f"w{i // 30}"] for i in range(60)]
+        assert _computeTopicChange(allText, 60) == [0] * 60
+
+    def test_uses_pool_and_records_holding(self, monkeypatch):
+        self._installFakeDeps(monkeypatch, labels=[0, 1])
+
+        acquired = []
+
+        class FakePool:
+            def acquire(self, name, factory, gpu=False):
+                acquired.append((name, gpu))
+                return factory()
+
+        holdings = []
+        allText = [[f"w{i // 30}"] for i in range(60)]
+        result = _computeTopicChange(allText, 60, pool=FakePool(), holdings=holdings)
+        assert acquired == [(POOL_NAME_TEXT2VEC, True)]
+        assert holdings == [POOL_NAME_TEXT2VEC]
+        assert sum(result) == 1
+
+    def test_missing_dependencies_returns_zero(self, monkeypatch):
+        import builtins
+
+        realImport = builtins.__import__
+
+        def guardedImport(name, *args, **kwargs):
+            if name in {"text2vec", "sklearn.cluster"}:
+                raise ImportError("not installed")
+            return realImport(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guardedImport)
+        allText = [[f"w{i // 30}"] for i in range(60)]
+        assert _computeTopicChange(allText, 60) == [0] * 60

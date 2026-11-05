@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for auth module — fromString, fromEnv edge cases."""
 
-import os
-import pytest
 from src.auth import Auth
 
 

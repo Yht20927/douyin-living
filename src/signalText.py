@@ -23,7 +23,7 @@ UTR_THRESHOLD = _cfg.utr_threshold
 _KEYWORD_CONFIG_PATH = Path(_cfg.keyword_config_path)
 
 # ── ModelPool name registry ──────────────────────────────────────────
-POOL_NAME_FASTTEXT = "fasttext:cc.zh.100"
+POOL_NAME_FASTTEXT = "fasttext:cc.zh.300"
 POOL_NAME_TEXT2VEC = f"text2vec:{_cfg.text2vec_model.replace('/', '-')}"
 POOL_NAME_HF_SENTIMENT = f"hf:{_cfg.sentiment_model.replace('/', '-').replace('uer-', '')}"
 
@@ -34,6 +34,7 @@ def extractFeatures(
     outputPath: str | None = None,
     keywordConfig: str | None = None,
     utrThreshold: float = UTR_THRESHOLD,
+    durationSec: float | None = None,
 ) -> dict:
     """Extract text features from danmaku JSONL and ASR JSON.
 
@@ -44,23 +45,33 @@ def extractFeatures(
         keywordConfig: Path to keywords JSON, defaults to config/keywords.json.
         utrThreshold: UTR below which text is considered spammy.
             Default 0.3 (lenient); raise to 0.5–0.6 for stricter filtering.
+        durationSec: Authoritative recording duration from the controller.
+            When omitted, the maximum danmaku/ASR timestamp is used.  The old
+            ``len(danmaku) // 10`` estimate is intentionally gone — it
+            silently truncated the text timeline and dropped every text
+            signal during fusion scoring.
 
     Returns:
-        dict with 'sampleRate', 'duration', 'features' keys.
+        dict with 'sampleRate', 'duration', 'features', 'status' keys.
     """
     log.info(f"Extracting text features: {danmakuPath} + {asrPath}")
     try:
         return _extractTextFeaturesImpl(
-            danmakuPath, asrPath, outputPath, keywordConfig, utrThreshold
+            danmakuPath, asrPath, outputPath, keywordConfig, utrThreshold,
+            durationSec=durationSec,
         )
-    except Exception:
+    except Exception as exc:
         log.exception(f"Text feature extraction failed for {danmakuPath}")
         empty = {
             "sampleRate": 1,
             "duration": 0,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "generatorVersion": "signalText/2",
+            "featureCount": 0,
             "features": {
                 "dmDensity": [], "dmAcceleration": [], "dmEntropy": [],
-                "dmSentiment": [], "dmUtr": [],
+                "dmSentiment": [], "dmUniqueUsers": [], "dmUtr": [],
                 "asrKeyword": [], "topicChange": [], "speakerChange": [],
             },
         }
@@ -70,12 +81,42 @@ def extractFeatures(
         return empty
 
 
+def _resolveDuration(
+    durationSec: float | None,
+    asrSegments: list[dict],
+    danmakuEntries: list[dict],
+) -> float:
+    """Resolve the text timeline length without inventing one.
+
+    Priority: controller-provided duration → ASR end → max danmaku timestamp.
+    """
+    if durationSec is not None and durationSec > 0:
+        return float(durationSec)
+
+    maxAsr = 0.0
+    for seg in asrSegments:
+        try:
+            maxAsr = max(maxAsr, float(seg.get("end") or 0.0))
+        except (TypeError, ValueError):
+            continue
+
+    maxDanmaku = 0.0
+    for entry in danmakuEntries:
+        try:
+            maxDanmaku = max(maxDanmaku, _parseTimestamp(entry))
+        except (TypeError, ValueError):
+            continue
+
+    return max(maxAsr, maxDanmaku, 0.0)
+
+
 def _extractTextFeaturesImpl(
     danmakuPath: str,
     asrPath: str,
     outputPath: str | None = None,
     keywordConfig: str | None = None,
     utrThreshold: float = UTR_THRESHOLD,
+    durationSec: float | None = None,
 ) -> dict:
     """Inner implementation — wrapped by extractFeatures with try/except."""
 
@@ -130,11 +171,9 @@ def _extractTextFeaturesImpl(
             asrSegments = []
 
         log.debug(f"Loaded {len(asrSegments)} ASR segments")
-        duration = max(
-            asrSegments[-1].get("end", 0) if asrSegments else 0,
-            len(danmakuEntries) // 10,  # rough estimate
-        )
+        duration = _resolveDuration(durationSec, asrSegments, danmakuEntries)
         nSecs = int(np.ceil(duration))
+        skippedOutOfRange = 0
 
         # ── Initialize feature arrays ───────────────────────────
         dmDensity = [0.0] * nSecs
@@ -153,6 +192,7 @@ def _extractTextFeaturesImpl(
             ts = _parseTimestamp(entry)
             sec = int(ts)
             if sec < 0 or sec >= nSecs:
+                skippedOutOfRange += 1
                 continue
 
             content = _getContent(entry)
@@ -213,7 +253,7 @@ def _extractTextFeaturesImpl(
                 return
             # Resolve relative to project root so the model is found regardless
             # of the current working directory.
-            modelPath = Path(__file__).resolve().parents[2] / _cfg.fasttext_model_path
+            modelPath = Path(__file__).resolve().parents[1] / _cfg.fasttext_model_path
             if not modelPath.exists():
                 log.warning(f"FastText model {modelPath} not found — falling back to exact match")
                 _fastTextModel = False
@@ -276,29 +316,46 @@ def _extractTextFeaturesImpl(
         # Compute topic change (text2vec + KMeans across all windows)
         topicVec = _computeTopicChange(allText30s, nSecs, _pool, _holdings)
 
+        featureDict = {
+            "dmDensity": dmAdjustedDensity,
+            "dmAcceleration": _secondDerivative(dmAdjustedDensity),
+            "dmEntropy": dmEntropyRaw,
+            "dmSentiment": [dmSentimentSum[i] / dmSentimentCount[i] if dmSentimentCount[i] > 0 else 0.0
+                            for i in range(nSecs)],
+            "dmUniqueUsers": uniqueUserCounts,
+            "dmUtr": utrRaw,
+            "asrKeyword": asrKeyword,
+            "topicChange": topicVec,
+            "speakerChange": speakerChange,
+        }
+        featureCount = sum(1 for values in featureDict.values() if values)
         features = {
             "sampleRate": 1,
             "duration": nSecs,
-            "features": {
-                "dmDensity": dmAdjustedDensity,
-                "dmAcceleration": _secondDerivative(dmAdjustedDensity),
-                "dmEntropy": dmEntropyRaw,
-                "dmSentiment": [dmSentimentSum[i] / dmSentimentCount[i] if dmSentimentCount[i] > 0 else 0.0
-                                for i in range(nSecs)],
-                "dmUniqueUsers": uniqueUserCounts,
-                "dmUtr": utrRaw,
-                "asrKeyword": asrKeyword,
-                "topicChange": topicVec,
-                "speakerChange": speakerChange,
+            "status": "ok" if featureCount else "empty",
+            "generatorVersion": "signalText/2",
+            "featureCount": featureCount,
+            "stats": {
+                "danmakuEntries": len(danmakuEntries),
+                "skippedOutOfRange": skippedOutOfRange,
+                "asrSegments": len(asrSegments),
+                "durationSource": "explicit" if durationSec else "inferred",
             },
+            "features": featureDict,
         }
+
+        if skippedOutOfRange:
+            log.warning(
+                f"{skippedOutOfRange}/{len(danmakuEntries)} danmaku entries "
+                f"outside 0..{nSecs}s were skipped"
+            )
 
         if outputPath:
             with open(outputPath, "w", encoding="utf-8") as f:
                 json.dump(features, f, ensure_ascii=False)
             log.info(f"Text features saved: {outputPath}")
 
-        log.info(f"Text features: {nSecs}s, {len(list(features['features'].keys()))} features")
+        log.info(f"Text features: {nSecs}s, {featureCount} non-empty features")
         return features
 
     finally:

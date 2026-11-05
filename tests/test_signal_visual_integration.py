@@ -2,7 +2,6 @@
 """Integration test for signalVisual — mock scenedetect + OpenCV."""
 
 import json
-import sys
 import numpy as np
 import pytest
 
@@ -53,6 +52,8 @@ class FakeSceneManager:
 class TestSignalVisualIntegration:
     def test_extract_features_with_mocks(self, tmp_path, monkeypatch):
         """Full visual feature extraction with mocked dependencies."""
+        pytest.importorskip("scenedetect")
+        pytest.importorskip("cv2")
         # Mock scenedetect (imported inside extractFeatures function)
         import scenedetect
 
@@ -86,6 +87,8 @@ class TestSignalVisualIntegration:
 
     def test_extract_features_top_level_exception(self, tmp_path, monkeypatch):
         """When scenedetect throws, extractFeatures should return empty structure."""
+        pytest.importorskip("scenedetect")
+        pytest.importorskip("cv2")
         import scenedetect
         monkeypatch.setattr(
             scenedetect,

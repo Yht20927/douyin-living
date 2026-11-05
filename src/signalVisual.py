@@ -10,10 +10,20 @@ log = getLogger(__name__)
 _cfg = load_settings().visual
 
 
+def _fit1Hz(values: list, target: int, padValue: float = 0.0) -> list:
+    """Fit a 1 Hz feature array to an expected timeline length."""
+    if target <= 0 or len(values) == target:
+        return values
+    if len(values) > target:
+        return values[:target]
+    return values + [padValue] * (target - len(values))
+
+
 def extractFeatures(
     videoPath: str,
     outputPath: str | None = None,
     faceDetection: bool = False,
+    durationSec: float | None = None,
 ) -> dict:
     """Extract visual features from a video file.
 
@@ -21,18 +31,27 @@ def extractFeatures(
         videoPath: Path to FLV/MP4 video.
         outputPath: If set, save JSON.
         faceDetection: If True, run insightface on candidate frames (Phase 2).
+        durationSec: Authoritative timeline length from the controller.  When
+            provided, arrays are fitted to this length so all signals share a
+            single timeline.
 
     Returns:
-        dict with 'sampleRate', 'duration', 'features' keys.
+        dict with 'sampleRate', 'duration', 'features', 'status' keys.
     """
     log.info(f"Extracting visual features: {videoPath}")
     try:
-        return _extractVisualFeaturesImpl(videoPath, outputPath, faceDetection)
-    except Exception:
+        return _extractVisualFeaturesImpl(
+            videoPath, outputPath, faceDetection, durationSec
+        )
+    except Exception as exc:
         log.exception(f"Visual feature extraction failed for {videoPath}")
         empty = {
             "sampleRate": 1,
             "duration": 0,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "generatorVersion": "signalVisual/2",
+            "featureCount": 0,
             "features": {"sceneChange": [], "motion": [], "faceCount": []},
         }
         if outputPath:
@@ -45,6 +64,7 @@ def _extractVisualFeaturesImpl(
     videoPath: str,
     outputPath: str | None = None,
     faceDetection: bool = False,
+    durationSec: float | None = None,
 ) -> dict:
     """Inner implementation — wrapped by extractFeatures with try/except."""
 
@@ -72,6 +92,9 @@ def _extractVisualFeaturesImpl(
             duration = frameCount / fpsProbe
             log.debug(f"Duration from OpenCV: {duration:.0f}s")
     nSecs = int(np.ceil(duration)) if duration > 0 else 0
+    expectedSecs = (
+        int(np.ceil(durationSec)) if durationSec and durationSec > 0 else nSecs
+    )
     log.debug(f"Duration: {duration:.0f}s, scenes: {len(sceneList)}")
 
     sceneChange = [0] * nSecs
@@ -151,15 +174,26 @@ def _extractVisualFeaturesImpl(
         log.debug("Skipping face detection in Phase 1 (use --face to enable)")
         # Phase 2: insightface on frames where score > threshold
 
+    # ── Align to expected timeline ─────────────────────────────
+    featureDict = {
+        "sceneChange": _fit1Hz(sceneChange, expectedSecs, 0),
+        "motion": _fit1Hz(motion, expectedSecs, motion[-1] if motion else 0.0),
+        "faceCount": _fit1Hz(faceCount, expectedSecs, 0),
+    }
+
     # ── Build output ───────────────────────────────────────────
     features = {
         "sampleRate": 1,
-        "duration": nSecs,
-        "features": {
-            "sceneChange": sceneChange,
-            "motion": motion,
-            "faceCount": faceCount,
+        "duration": expectedSecs,
+        "status": "ok" if any(featureDict.values()) else "empty",
+        "generatorVersion": "signalVisual/2",
+        "featureCount": sum(1 for values in featureDict.values() if values),
+        "stats": {
+            "videoDurationSec": round(float(duration), 3),
+            "durationSource": "explicit" if durationSec else "video",
+            "scenes": len(sceneList),
         },
+        "features": featureDict,
     }
 
     if outputPath:
@@ -167,5 +201,5 @@ def _extractVisualFeaturesImpl(
             json.dump(features, f, ensure_ascii=False)
         log.info(f"Visual features saved: {outputPath}")
 
-    log.info(f"Visual features: {nSecs}s, {len(list(features['features'].keys()))} features")
+    log.info(f"Visual features: {expectedSecs}s, {features['featureCount']} non-empty features")
     return features
