@@ -679,6 +679,16 @@ src/pipeline/
 - 明确“ASR 失败 → 文本特征降级 → pipeline 状态”的链路；
 - 固定 faster-whisper/whisperx 版本，避免 API 漂移。
 
+> **S5-5 执行记录（2026-11-05）**：
+>
+> - 新增 `config/asr.yaml` 与 `AsrSettings`：模型、CPU/CUDA 自适应型号、设备、compute type、语言、diarize、batch size、VAD、beam size、分块与续跑参数；环境变量统一为 `ASR_*`，旧的 `PIPELINE_ASR_MODEL/DEVICE/COMPUTE_TYPE/DIARIZE` 保留为别名。
+> - `model=auto` 在 CPU 上解析为 `auto_model_cpu`（默认 `base`），CUDA 上解析为 `auto_model_cuda`（默认 `small`），默认不选 `large-v3`；显式 `cuda` 但 CUDA 不可用时降级 CPU，CPU 上配置 `float16/int8_float16/bfloat16` 时自动改为 `int8`，选择过程写入日志与运行结果。
+> - 超过 `chunk_sec`（默认 1800 秒）的音频由 ffmpeg 重编码为 16 kHz 单声道分块；每完成一块写 `<asr_json>.chunks.json` 检查点，失败保留、成功后删除。检查点签名包含音频 size/mtime、分块长度与全部 ASR 运行参数，音频或配置变化自动失效；`resume=false` 可关闭续跑。
+> - Controller 在缓存检查前解析实际 runtime，并用解析后的 model/device/compute/language/VAD 等参数作为缓存 key，避免 CPU（base）与 CUDA（small）误用同一份 ASR 产物。
+> - ASR 失败链路明确：controller 写出 `{"status":"failed","segments":[],"error":...}`，`pipeline_status.json` 的 `2_asr` 为 `failed`；`signalText` 容忍缺失/损坏/失败 ASR，降级为仅弹幕特征，并在 `text_features.json.stats` 记录 `asrStatus/asrDegraded/asrError`，文本步骤 meta 同步记录 `asrStatus`。
+> - `faster-whisper` 固定为 `>=1.0,<2.0`，`whisperx` 固定为 `>=3.1,<4.0`，避免上游大版本 API 漂移。
+> - 新增测试覆盖 auto 型号/设备解析、CPU compute 降级、VAD 参数透传、输出 JSON/SRT、分块失败后续跑、音频变化使检查点失效、ffmpeg 缺失、ASR_* 与旧环境变量别名、ASR 失败/缺失/损坏时的文本降级、解析后 runtime 进入缓存 key、ASR 异常时 pipeline 状态与文本步骤 `asrStatus`。全量 **528 passed**，覆盖率 **86%**，`ruff check` 与 `git diff --check` 全绿；另用真实 ffmpeg 验证了 5 秒音频按 2 秒分块及偏移计算。
+
 ### S5-6 评估体系与标注集
 
 **标注集**

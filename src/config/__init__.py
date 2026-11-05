@@ -4,6 +4,7 @@
 from src.config.settings import (
     ScorerSettings,
     AudioSettings,
+    AsrSettings,
     TextSettings,
     VisualSettings,
     RecordingSettings,
@@ -15,6 +16,7 @@ from src.config.loader import reload_settings
 __all__ = [
     "ScorerSettings",
     "AudioSettings",
+    "AsrSettings",
     "TextSettings",
     "VisualSettings",
     "RecordingSettings",

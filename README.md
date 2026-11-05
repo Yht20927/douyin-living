@@ -111,6 +111,8 @@ python extractAudio.py video.flv out.mp3   # → out.mp3
 python asr.py audio.aac                    # → audio_asr.json + audio_asr.srt
 python asr.py audio.aac --model tiny       # 快速模式
 python asr.py audio.aac --no-diarize       # 跳过说话人分离
+python asr.py audio.aac --chunk-sec 600    # 10 分钟分块 + 断点续跑
+python asr.py audio.aac --no-resume        # 忽略已完成分块
 ```
 
 ---
@@ -239,6 +241,44 @@ python scripts/benchmark_visual.py --video /data/1h-1080p.flv --json /tmp/visual
 
 建议用 1 小时 1080p 文件记录 `elapsedSec` 与 `realtimeFactor`，作为后续视觉改动的
 回归指标。
+
+### ASR 配置与质量（Sprint 5 / S5-5）
+
+ASR 运行参数独立放在 `config/asr.yaml`，环境变量使用 `ASR_*`；旧
+`PIPELINE_ASR_MODEL/DEVICE/COMPUTE_TYPE/DIARIZE` 仍作为别名兼容。
+
+```yaml
+# model=auto 时：CPU → auto_model_cpu（base），CUDA → auto_model_cuda（small）
+model: "auto"
+auto_model_cpu: "base"
+auto_model_cuda: "small"
+device: "auto"
+compute_type: "int8"
+language: "zh"
+diarize: true
+batch_size: 32
+vad_filter: true
+vad_min_silence_ms: 500
+vad_speech_pad_ms: 200
+beam_size: 5
+chunk_sec: 1800
+resume: true
+```
+
+- 默认不选 `large-v3`：4GB 显存和 CPU 环境无法稳定运行；需要时显式设置
+  `ASR_MODEL=large-v3`；
+- 当 `device=auto` 但 CUDA 不可用、或 CPU 上配置了 CUDA-only 的
+  `float16/int8_float16/bfloat16` 时，会自动降级到 CPU/int8 并在日志中说明；
+- 超过 `chunk_sec`（默认 30 分钟）的音频会经 ffmpeg 重编码为 16 kHz 单声道分块；
+  每完成一块就写 `<asr_json>.chunks.json`，进程中断后重跑会跳过已完成块；
+  全部成功后删除检查点，失败则保留以便续跑。检查点签名包含音频大小/修改时间与
+  全部 ASR 参数，音频或配置变化会自动失效；
+- ASR 失败时 controller 仍写出 `{"status":"failed","segments":[],"error":...}`，
+  `pipeline_status.json` 的 `2_asr` 标记为 `failed`；文本特征不会整体失败，而是
+  降级为仅弹幕信号，并在 `text_features.json` 的
+  `stats.asrStatus/asrDegraded/asrError` 记录原因。修复模型后：
+  `--only-step asr` 重跑 ASR，再用 `--from-step signal` 继续；
+- `faster-whisper` 固定在 1.x、`whisperx` 固定在 3.x，避免上游 API 漂移。
 
 ### 直播类型预设
 

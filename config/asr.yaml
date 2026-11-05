@@ -1,0 +1,27 @@
+# ASR runtime configuration (Sprint 5 / S5-5).
+# Environment overrides use the ASR_ prefix (ASR_MODEL, ASR_DEVICE, ...).
+# Legacy PIPELINE_ASR_MODEL / DEVICE / COMPUTE_TYPE / DIARIZE are still accepted.
+
+# auto = auto_model_cpu on CPU, auto_model_cuda on CUDA.
+# Never default to large-v3: 4GB GPUs and CPU-only hosts cannot run it reliably.
+model: "auto"
+auto_model_cpu: "base"
+auto_model_cuda: "small"
+device: "auto"
+compute_type: "int8"
+language: "zh"
+diarize: true
+
+# WhisperX diarization batch size.
+batch_size: 32
+
+# faster-whisper VAD parameters.
+vad_filter: true
+vad_min_silence_ms: 500
+vad_speech_pad_ms: 200
+beam_size: 5
+
+# Long recordings are split into 30-minute chunks. Completed chunks are
+# checkpointed next to the ASR artifact and reused after a crash/timeout.
+chunk_sec: 1800
+resume: true

@@ -32,6 +32,7 @@ from src.log.events import logEvent
 from src.log.logger import getLogger
 from src.util import fmtSize
 from src.config import load_settings
+from src.asrRuntime import resolveAsrRuntime
 from src.contracts import (
     RecordingMeta,
     artifactFingerprint,
@@ -44,6 +45,7 @@ from src.pipeline import ArtifactCache, CacheDecision, PipelineStatus, StepStatu
 
 log = getLogger(__name__)
 _cfg = load_settings().pipeline
+_asrCfg = load_settings().asr
 
 # Canonical resumable pipeline stages, in execution order.  Physical status
 # steps (1_audio_extract, 4_audio_signal, ...) map onto these groups.
@@ -649,10 +651,21 @@ class Controller:
         # ── Step 2: ASR + diarization ──────────────────────────
         log.info("Step 2: ASR...")
         asrPath = audioPath.rsplit(".", 1)[0] + "_asr.json"
+        # Resolve auto model/device before the cache check: a CPU run (base)
+        # and a CUDA run (small) must not share the same cached artifact.
+        asrRuntime = resolveAsrRuntime(_asrCfg)
         asrParams = {
-            "model": _cfg.asr_model,
-            "computeType": _cfg.asr_compute_type,
-            "diarize": _cfg.asr_diarize,
+            "model": asrRuntime["model"],
+            "device": asrRuntime["device"],
+            "computeType": asrRuntime["computeType"],
+            "language": asrRuntime["language"],
+            "diarize": asrRuntime["diarize"],
+            "batchSize": asrRuntime["batchSize"],
+            "vadFilter": asrRuntime["vadFilter"],
+            "vadMinSilenceMs": asrRuntime["vadMinSilenceMs"],
+            "vadSpeechPadMs": asrRuntime["vadSpeechPadMs"],
+            "beamSize": asrRuntime["beamSize"],
+            "chunkSec": asrRuntime["chunkSec"],
         }
         status.startStep("2_asr", inputs=[audioPath])
 
@@ -690,31 +703,28 @@ class Controller:
             startedAt = time.monotonic()
             try:
                 from asr import transcribe
-                device = _cfg.asr_device
-                if device == "auto":
-                    import torch
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                elif device == "cuda":
-                    import torch
-                    if not torch.cuda.is_available():
-                        log.warning(
-                            "ASR device=cuda requested but CUDA is unavailable "
-                            "— falling back to CPU"
-                        )
-                        device = "cpu"
                 log.info(
-                    f"ASR model: {_cfg.asr_model}, device: {device}, "
-                    f"compute: {_cfg.asr_compute_type}, diarize: {_cfg.asr_diarize}"
+                    f"ASR model: {asrRuntime['model']}, device: {asrRuntime['device']}, "
+                    f"compute: {asrRuntime['computeType']}, "
+                    f"diarize: {asrRuntime['diarize']} ({asrRuntime['selection']})"
                 )
                 # Offload blocking ASR to thread pool so the event loop stays alive
                 await asyncio.to_thread(
                     transcribe,
                     audioPath,
-                    modelSize=_cfg.asr_model,
-                    device=device,
-                    computeType=_cfg.asr_compute_type,
-                    diarize=_cfg.asr_diarize,
+                    modelSize=asrRuntime["model"],
+                    language=asrRuntime["language"],
+                    device=asrRuntime["device"],
+                    computeType=asrRuntime["computeType"],
+                    diarize=asrRuntime["diarize"],
                     outputPath=asrPath,
+                    batchSize=asrRuntime["batchSize"],
+                    vadFilter=asrRuntime["vadFilter"],
+                    vadMinSilenceMs=asrRuntime["vadMinSilenceMs"],
+                    vadSpeechPadMs=asrRuntime["vadSpeechPadMs"],
+                    beamSize=asrRuntime["beamSize"],
+                    chunkSec=asrRuntime["chunkSec"],
+                    resume=asrRuntime["resume"],
                 )
                 asrInfo = inspectAsrArtifact(asrPath)
                 elapsedMs = int((time.monotonic() - startedAt) * 1000)
@@ -774,6 +784,13 @@ class Controller:
                         "elapsedMs": elapsedMs,
                     },
                 )
+
+        asrSignalStatus = inspectAsrArtifact(asrPath)["status"]
+        if asrSignalStatus != "ok":
+            log.warning(
+                f"ASR status is {asrSignalStatus} — text features will degrade "
+                "to danmaku-only signals"
+            )
 
         if self._stopAfter("asr"):
             log.info("--only-step asr: stopping before signal extraction")
@@ -859,6 +876,11 @@ class Controller:
                             "featureCount": info["featureCount"],
                             "duration": info["duration"],
                             "featureNames": info["featureNames"],
+                            **(
+                                {"asrStatus": asrSignalStatus}
+                                if stepName == "5_text_signal"
+                                else {}
+                            ),
                         },
                     )
                     continue
@@ -935,6 +957,11 @@ class Controller:
                             stepName, CacheDecision(False, "rebuilt")
                         ).reason,
                         "elapsedMs": elapsedMs,
+                        **(
+                            {"asrStatus": asrSignalStatus}
+                            if stepName == "5_text_signal"
+                            else {}
+                        ),
                     },
                 )
 

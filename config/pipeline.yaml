@@ -9,6 +9,8 @@ signal_pool_workers: 3
 ffmpeg_timeout_clip: 300
 ffmpeg_timeout_thumbnail: 60
 ffmpeg_timeout_burn: 300
+# Deprecated ASR aliases kept for older configs; new values live in
+# config/asr.yaml (ASR_* env vars, legacy PIPELINE_ASR_* also accepted).
 asr_model: "base"
 asr_device: "auto"
 asr_compute_type: "int8"

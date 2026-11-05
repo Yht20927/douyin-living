@@ -200,19 +200,44 @@ def _extractTextFeaturesImpl(
         log.debug(f"Loaded {len(danmakuEntries)} danmaku messages")
 
         # ── Load ASR ────────────────────────────────────────────
+        # ASR failure must degrade to danmaku-only, not abort text features.
         log.debug("Loading ASR...")
-        with open(asrPath, encoding="utf-8") as f:
-            asrData = json.load(f)
+        asrStatus = "ok"
+        asrError = None
+        try:
+            with open(asrPath, encoding="utf-8") as f:
+                asrData = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            asrData = None
+            asrStatus = "missing" if isinstance(exc, OSError) else "invalid"
+            asrError = f"{type(exc).__name__}: {exc}"
+            log.warning(f"ASR unavailable ({asrError}) — using danmaku only")
 
         # Defensive: ASR may output {"status":"failed","segments":[]} or a plain list.
         if isinstance(asrData, list):
             asrSegments = asrData
         elif isinstance(asrData, dict):
             asrSegments = asrData.get("segments", [])
+            asrStatus = str(asrData.get("status") or asrStatus).lower()
+            asrError = asrData.get("error") or asrError
         else:
             asrSegments = []
 
-        log.debug(f"Loaded {len(asrSegments)} ASR segments")
+        if not isinstance(asrSegments, list):
+            asrStatus = "invalid"
+            asrError = asrError or "ASR 'segments' is not a list"
+            asrSegments = []
+        elif asrStatus == "ok" and not asrSegments:
+            # Keep stats consistent with inspectAsrArtifact(): an otherwise
+            # valid ASR file without segments is "empty", not "ok".
+            asrStatus = "empty"
+
+        asrDegraded = asrStatus not in {"ok", "empty"} or not asrSegments
+        if asrStatus not in {"ok", "empty"}:
+            log.warning(
+                f"ASR status={asrStatus} — text features degrade to danmaku-only"
+            )
+        log.debug(f"Loaded {len(asrSegments)} ASR segments (status={asrStatus})")
         duration = _resolveDuration(durationSec, asrSegments, danmakuEntries)
         nSecs = int(np.ceil(duration))
         skippedOutOfRange = 0
@@ -422,6 +447,9 @@ def _extractTextFeaturesImpl(
                 "danmakuEntries": len(danmakuEntries),
                 "skippedOutOfRange": skippedOutOfRange,
                 "asrSegments": len(asrSegments),
+                "asrStatus": asrStatus,
+                "asrDegraded": asrDegraded,
+                "asrError": str(asrError)[:300] if asrError else None,
                 "durationSource": "explicit" if durationSec else "inferred",
                 "sentimentMode": _cfg.sentiment_mode,
                 "rateWindowRadius": _cfg.dm_rate_window_radius,

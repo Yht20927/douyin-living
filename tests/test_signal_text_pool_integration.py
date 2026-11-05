@@ -223,3 +223,95 @@ class TestPoolReleaseDiscipline:
                 assert pool.evict(name), (
                     f"{name} accumulated refcount over consecutive extracts"
                 )
+
+
+class TestAsrDegradation:
+    """S5-5: a failed/missing ASR artifact must degrade to danmaku-only."""
+
+    def _writeDanmaku(self, path: Path) -> str:
+        path.write_text(
+            json.dumps(
+                {"recvTimeSec": 0.5, "content": "哈哈太好笑了", "userId": "u1"},
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {"recvTimeSec": 2.0, "content": "牛 nice", "userId": "u2"},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_failed_asr_returns_danmaku_only_features(
+        self, _stub_modules, tmp_path
+    ):
+        danmakuPath = self._writeDanmaku(tmp_path / "dm.jsonl")
+        asrPath = tmp_path / "asr.json"
+        asrPath.write_text(
+            json.dumps(
+                {"status": "failed", "segments": [], "error": "CUDA out of memory"},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = signalText.extractFeatures(danmakuPath, str(asrPath))
+
+        assert result["status"] == "ok"
+        assert result["stats"]["asrStatus"] == "failed"
+        assert result["stats"]["asrDegraded"] is True
+        assert result["stats"]["asrError"] == "CUDA out of memory"
+        assert result["stats"]["asrSegments"] == 0
+        assert result["features"]["dmDensity"]
+
+    def test_missing_asr_file_degrades(self, _stub_modules, tmp_path):
+        danmakuPath = self._writeDanmaku(tmp_path / "dm.jsonl")
+        missingPath = tmp_path / "missing_asr.json"
+
+        result = signalText.extractFeatures(danmakuPath, str(missingPath))
+
+        assert result["status"] == "ok"
+        assert result["stats"]["asrStatus"] == "missing"
+        assert result["stats"]["asrDegraded"] is True
+        assert "FileNotFoundError" in result["stats"]["asrError"]
+
+    def test_invalid_asr_json_degrades(self, _stub_modules, tmp_path):
+        danmakuPath = self._writeDanmaku(tmp_path / "dm.jsonl")
+        asrPath = tmp_path / "asr.json"
+        asrPath.write_text("{not-json", encoding="utf-8")
+
+        result = signalText.extractFeatures(danmakuPath, str(asrPath))
+
+        assert result["status"] == "ok"
+        assert result["stats"]["asrStatus"] == "invalid"
+        assert result["stats"]["asrDegraded"] is True
+
+    def test_plain_list_asr_stays_ok(self, _stub_modules, tmp_path):
+        danmakuPath = self._writeDanmaku(tmp_path / "dm.jsonl")
+        asrPath = tmp_path / "asr.json"
+        asrPath.write_text(
+            json.dumps(
+                [{"start": 0, "end": 2, "text": "大家好", "speaker": "S1"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = signalText.extractFeatures(danmakuPath, str(asrPath))
+
+        assert result["stats"]["asrStatus"] == "ok"
+        assert result["stats"]["asrDegraded"] is False
+        assert result["stats"]["asrSegments"] == 1
+
+    def test_empty_asr_is_reported_as_empty(self, _stub_modules, tmp_path):
+        danmakuPath = self._writeDanmaku(tmp_path / "dm.jsonl")
+        asrPath = tmp_path / "asr.json"
+        asrPath.write_text("[]", encoding="utf-8")
+
+        result = signalText.extractFeatures(danmakuPath, str(asrPath))
+
+        assert result["stats"]["asrStatus"] == "empty"
+        assert result["stats"]["asrDegraded"] is True
+        assert result["stats"]["asrSegments"] == 0

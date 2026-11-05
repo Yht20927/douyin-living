@@ -295,7 +295,7 @@ jq -r 'select(.event == "pipeline.finish")
 
 6. 离线部署时，先在有网机器完成下载并把缓存目录同步到目标机器；确认 `scripts/download_models.py --check --strict` 通过后再设置 `HF_HUB_OFFLINE=1`。不要在模型尚未缓存时开启离线模式。
 
-7. 模型缺失不一定会中断整个切片：ASR 失败会把 `*_asr.json` 标记为 `failed`，下次运行自动重试；文本/视觉特征缺失会降低打分质量。修复模型后重跑：
+7. 模型缺失不一定会中断整个切片：ASR 失败会把 `*_asr.json` 标记为 `failed`，下次运行自动重试；文本特征会降级为仅弹幕信号（`text_features.json` 的 `stats.asrStatus/asrDegraded/asrError` 记录原因），视觉特征缺失会降低打分质量。修复模型后重跑：
 
    ```bash
    python -m src.controller "$ROOM" --clip-only --only-step asr
@@ -374,27 +374,30 @@ jq -r 'select(.event == "pipeline.finish")
    dmesg | tail -30        # 查找 OOM killer / Killed process
    ```
 
-2. 降低 ASR 资源占用。以下配置在 `config/pipeline.yaml`，也可用环境变量覆盖（无需改代码）：
+2. 降低 ASR 资源占用。以下配置在 `config/asr.yaml`，也可用环境变量覆盖（无需改代码）。
+   新变量使用 `ASR_*` 前缀；旧 `PIPELINE_ASR_*` 仍可作为别名使用：
 
    | 配置 | 环境变量 | 默认 | 说明 |
    |------|----------|------|------|
-   | `asr_model` | `PIPELINE_ASR_MODEL` | `base` | `tiny` 最省资源，`large-v3` 最吃显存 |
-   | `asr_device` | `PIPELINE_ASR_DEVICE` | `auto` | `auto/cuda/cpu`；显存不足时用 `cpu` |
-   | `asr_compute_type` | `PIPELINE_ASR_COMPUTE_TYPE` | `int8` | GPU 可选 `float16`，CPU 保持 `int8` |
-   | `asr_diarize` | `PIPELINE_ASR_DIARIZE` | `true` | 设为 `false` 可关闭说话人分离，显著省内存 |
+   | `model` | `ASR_MODEL`（旧 `PIPELINE_ASR_MODEL`） | `auto` | `auto` 时 CPU 用 `base`、CUDA 用 `small`；`tiny` 最省资源，`large-v3` 最吃显存 |
+   | `device` | `ASR_DEVICE`（旧 `PIPELINE_ASR_DEVICE`） | `auto` | `auto/cuda/cpu`；显存不足时用 `cpu` |
+   | `compute_type` | `ASR_COMPUTE_TYPE`（旧 `PIPELINE_ASR_COMPUTE_TYPE`） | `int8` | GPU 可选 `float16`，CPU 保持 `int8` |
+   | `diarize` | `ASR_DIARIZE`（旧 `PIPELINE_ASR_DIARIZE`） | `true` | 设为 `false` 可关闭说话人分离，显著省内存 |
+   | `chunk_sec` | `ASR_CHUNK_SEC` | `1800` | 长音频分块长度；`0` 关闭分块 |
+   | `resume` | `ASR_RESUME` | `true` | 复用 `<asr_json>.chunks.json` 中已完成的分块 |
 
    最小资源组合示例（建议 `export` 后在同一个 shell 中完成重试）：
 
    ```bash
-   export PIPELINE_ASR_MODEL=tiny
-   export PIPELINE_ASR_DEVICE=cpu
-   export PIPELINE_ASR_COMPUTE_TYPE=int8
-   export PIPELINE_ASR_DIARIZE=false
+   export ASR_MODEL=tiny
+   export ASR_DEVICE=cpu
+   export ASR_COMPUTE_TYPE=int8
+   export ASR_DIARIZE=false
 
    python -m src.controller "$ROOM" --clip-only --only-step asr
    ```
 
-   如果这是长期配置，直接把对应值写入 `config/pipeline.yaml`，避免忘记设置环境变量导致下一次运行又回到默认模型。
+   如果这是长期配置，直接把对应值写入 `config/asr.yaml`，避免忘记设置环境变量导致下一次运行又回到默认模型。
 
 3. CUDA OOM 的补充手段：
 
@@ -416,7 +419,7 @@ jq -r 'select(.event == "pipeline.finish")
    python -m src.controller "$ROOM" --clip-only --from-step signal
    ```
 
-   上面两条命令必须使用与 ASR 相同的环境变量/配置（例如都设置 `PIPELINE_ASR_MODEL=tiny`），否则 ASR 参数变化会再次触发重建。也可以直接跑完整 `--clip-only`，缓存会自动判断哪些步骤需要重建。
+   上面两条命令必须使用与 ASR 相同的环境变量/配置（例如都设置 `ASR_MODEL=tiny`），否则 ASR 参数变化会再次触发重建。也可以直接跑完整 `--clip-only`，缓存会自动判断哪些步骤需要重建。
 
 6. 如果仍然被 OOM killer 杀死，先用独立命令定位：
 

@@ -475,6 +475,54 @@ class TestPipelineCache:
         runPipeline(outputDir)
         assert calls["asr"] == beforeAsr + 1
 
+    def test_asr_failure_degrades_text_and_reports_status(
+        self, pipelineEnv, monkeypatch
+    ):
+        outputDir = pipelineEnv["outputDir"]
+        asrModule = sys.modules["asr"]
+
+        def failing(*args, **kwargs):
+            raise RuntimeError("simulated ASR crash")
+
+        monkeypatch.setattr(asrModule, "transcribe", failing)
+        runPipeline(outputDir)
+
+        saved = loadStatus(outputDir)
+        assert saved["steps"]["2_asr"]["status"] == "failed"
+        asrDoc = json.loads(
+            (outputDir / "room_merged_asr.json").read_text(encoding="utf-8")
+        )
+        assert asrDoc["status"] == "failed"
+        assert asrDoc["segments"] == []
+        assert "simulated ASR crash" in asrDoc["error"]
+
+        textStep = saved["steps"]["5_text_signal"]
+        assert textStep["status"] == "ok"
+        assert textStep["meta"]["asrStatus"] == "failed"
+
+    def test_asr_cache_key_uses_resolved_runtime(self, pipelineEnv, monkeypatch):
+        import src.controller as controllerModule
+
+        outputDir = pipelineEnv["outputDir"]
+        calls = pipelineEnv["calls"]
+        runPipeline(outputDir)
+        beforeAsr = calls["asr"]
+
+        resolved = dict(
+            controllerModule.resolveAsrRuntime(controllerModule._asrCfg)
+        )
+        resolved["model"] = "medium"
+        monkeypatch.setattr(
+            controllerModule, "resolveAsrRuntime", lambda cfg: resolved
+        )
+
+        runPipeline(outputDir)
+        assert calls["asr"] == beforeAsr + 1
+
+        # Same resolved runtime → cache hit again.
+        runPipeline(outputDir)
+        assert calls["asr"] == beforeAsr + 1
+
     def test_missing_or_corrupt_meta_triggers_rebuild(self, pipelineEnv):
         outputDir = pipelineEnv["outputDir"]
         calls = pipelineEnv["calls"]

@@ -1,8 +1,8 @@
 # AI dependencies for speech recognition, NLP, and computer vision
 # Install after requirements.txt
 
-# ASR
-faster-whisper>=1.0
+# ASR — pinned to the 1.x API (WhisperModel/transcribe contract).
+faster-whisper>=1.0,<2.0
 
 # Audio features
 librosa>=0.10
@@ -23,8 +23,8 @@ scikit-image>=0.20
 # PyTorch backend (required by faster-whisper, text2vec, panns)
 torch>=2.0
 
-# Optional: speaker diarization (heavy)
-# whisperx>=3.1
+# Optional: speaker diarization (heavy), pinned to the 3.x API.
+# whisperx>=3.1,<4.0
 
 # Optional: face detection (heavy)
 # insightface>=0.7

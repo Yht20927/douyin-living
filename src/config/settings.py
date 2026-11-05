@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -337,6 +337,67 @@ class VisualSettings(_YamlSectionSettings):
         return value
 
 
+class AsrSettings(_YamlSectionSettings):
+    """ASR runtime knobs (config/asr.yaml).
+
+    ``model=auto`` resolves to ``auto_model_cpu`` on CPU and
+    ``auto_model_cuda`` on CUDA.  Legacy ``PIPELINE_ASR_*`` environment
+    variables remain accepted as aliases for the fields that used to live in
+    ``PipelineSettings``.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASR_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    _yaml_name: ClassVar[str] = "asr"
+
+    model: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("ASR_MODEL", "PIPELINE_ASR_MODEL"),
+        pattern=r"^(auto|tiny|base|small|medium|large-v3)$",
+    )
+    auto_model_cpu: str = Field(
+        default="base", pattern=r"^(tiny|base|small|medium|large-v3)$"
+    )
+    auto_model_cuda: str = Field(
+        default="small", pattern=r"^(tiny|base|small|medium|large-v3)$"
+    )
+    device: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("ASR_DEVICE", "PIPELINE_ASR_DEVICE"),
+        pattern=r"^(auto|cuda|cpu)$",
+    )
+    compute_type: str = Field(
+        default="int8",
+        validation_alias=AliasChoices(
+            "ASR_COMPUTE_TYPE", "PIPELINE_ASR_COMPUTE_TYPE"
+        ),
+        pattern=(
+            r"^(default|auto|int8|int8_float32|int8_float16|int8_bfloat16"
+            r"|int16|float16|bfloat16|float32)$"
+        ),
+    )
+    language: str = Field(
+        default="zh",
+        pattern=r"^(auto|[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?)$",
+    )
+    diarize: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ASR_DIARIZE", "PIPELINE_ASR_DIARIZE"),
+    )
+    batch_size: int = Field(default=32, ge=1)
+    vad_filter: bool = True
+    vad_min_silence_ms: int = Field(default=500, ge=0)
+    vad_speech_pad_ms: int = Field(default=200, ge=0)
+    beam_size: int = Field(default=5, ge=1, le=10)
+    # Long recordings are split into chunks; 0 disables chunking.
+    chunk_sec: float = Field(default=1800.0, ge=0.0)
+    resume: bool = True
+
+
 class RecordingSettings(_YamlSectionSettings):
     model_config = SettingsConfigDict(env_prefix="RECORDER_", extra="ignore")
 
@@ -430,6 +491,7 @@ class AppSettings(BaseSettings):
     audio: AudioSettings = Field(default_factory=AudioSettings)
     text: TextSettings = Field(default_factory=TextSettings)
     visual: VisualSettings = Field(default_factory=VisualSettings)
+    asr: AsrSettings = Field(default_factory=AsrSettings)
     recording: RecordingSettings = Field(default_factory=RecordingSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
 

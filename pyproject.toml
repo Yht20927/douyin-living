@@ -25,8 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 ai = [
-    # ASR
-    "faster-whisper>=1.0",
+    # ASR — pinned to the 1.x API (WhisperModel/transcribe contract).
+    "faster-whisper>=1.0,<2.0",
     "librosa>=0.10",
     # NLP
     "jieba>=0.42",
@@ -39,8 +39,8 @@ ai = [
     "opencv-python>=4.8",
     # Audio events
     "panns-inference>=0.1",
-    # Diarization (optional, heavy)
-    "whisperx>=3.1",
+    # Diarization (optional, heavy) — pinned to the 3.x API.
+    "whisperx>=3.1,<4.0",
     "torch>=2.0",
     # Face detection (optional)
     "insightface>=0.7",

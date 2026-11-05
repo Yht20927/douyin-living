@@ -9,6 +9,7 @@ from src.config import (
     reload_settings,
     ScorerSettings,
     AudioSettings,
+    AsrSettings,
     TextSettings,
     VisualSettings,
     RecordingSettings,
@@ -23,6 +24,7 @@ class TestLoadSettings:
         assert s.audio is not None
         assert s.text is not None
         assert s.visual is not None
+        assert s.asr is not None
         assert s.recording is not None
         assert s.pipeline is not None
 
@@ -105,6 +107,67 @@ class TestVisualSettingsDefaults:
         assert s.enable_face is False
         assert s.opticalflow_resolution == (320, 240)
         assert s.opticalflow_sample_interval == 5
+
+
+class TestAsrSettingsDefaults:
+    def test_defaults(self):
+        s = AsrSettings()
+        assert s.model == "auto"
+        assert s.auto_model_cpu == "base"
+        assert s.auto_model_cuda == "small"
+        assert s.device == "auto"
+        assert s.compute_type == "int8"
+        assert s.language == "zh"
+        assert s.diarize is True
+        assert s.batch_size == 32
+        assert s.vad_filter is True
+        assert s.vad_min_silence_ms == 500
+        assert s.vad_speech_pad_ms == 200
+        assert s.beam_size == 5
+        assert s.chunk_sec == 1800.0
+        assert s.resume is True
+
+    def test_new_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("ASR_MODEL", "tiny")
+        monkeypatch.setenv("ASR_DEVICE", "cpu")
+        monkeypatch.setenv("ASR_COMPUTE_TYPE", "float32")
+        monkeypatch.setenv("ASR_LANGUAGE", "auto")
+        monkeypatch.setenv("ASR_DIARIZE", "false")
+        monkeypatch.setenv("ASR_BATCH_SIZE", "8")
+        monkeypatch.setenv("ASR_VAD_FILTER", "false")
+        monkeypatch.setenv("ASR_VAD_MIN_SILENCE_MS", "700")
+        monkeypatch.setenv("ASR_VAD_SPEECH_PAD_MS", "100")
+        monkeypatch.setenv("ASR_BEAM_SIZE", "3")
+        monkeypatch.setenv("ASR_CHUNK_SEC", "600")
+        monkeypatch.setenv("ASR_RESUME", "false")
+        s = AsrSettings()
+        assert s.model == "tiny"
+        assert s.device == "cpu"
+        assert s.compute_type == "float32"
+        assert s.language == "auto"
+        assert s.diarize is False
+        assert s.batch_size == 8
+        assert s.vad_filter is False
+        assert s.vad_min_silence_ms == 700
+        assert s.vad_speech_pad_ms == 100
+        assert s.beam_size == 3
+        assert s.chunk_sec == 600.0
+        assert s.resume is False
+
+    def test_legacy_pipeline_env_aliases(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_ASR_MODEL", "medium")
+        monkeypatch.setenv("PIPELINE_ASR_DEVICE", "cpu")
+        monkeypatch.setenv("PIPELINE_ASR_COMPUTE_TYPE", "float32")
+        monkeypatch.setenv("PIPELINE_ASR_DIARIZE", "false")
+        s = AsrSettings()
+        assert s.model == "medium"
+        assert s.device == "cpu"
+        assert s.compute_type == "float32"
+        assert s.diarize is False
+
+    def test_invalid_model_rejected(self):
+        with pytest.raises(ValidationError, match="model"):
+            AsrSettings(model="huge")
 
 
 class TestRecordingSettingsDefaults:
