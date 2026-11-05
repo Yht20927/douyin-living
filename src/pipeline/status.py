@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.contracts import (
     SCHEMA_VERSION,
@@ -36,6 +36,9 @@ class StepStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     INVALID = "invalid"
+
+
+StepCallback = Callable[[str, dict[str, Any]], None]
 
 
 def _coerceStatus(value: StepStatus | str) -> StepStatus:
@@ -70,7 +73,12 @@ def collectEnvironment() -> dict[str, Any]:
 
 
 class PipelineStatus:
-    """Mutable status document for one pipeline run."""
+    """Mutable status document for one pipeline run.
+
+    ``onStep(name, record)`` is called after every completed step with a
+    snapshot of its record; it is used by the controller to emit structured
+    events and must never raise into the pipeline.
+    """
 
     def __init__(
         self,
@@ -79,6 +87,7 @@ class PipelineStatus:
         runId: str | None = None,
         profile: str | None = None,
         sensitivity: float | None = None,
+        onStep: StepCallback | None = None,
     ):
         now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.roomId = roomId
@@ -86,12 +95,14 @@ class PipelineStatus:
         self.runId = runId or f"{now}-{uuid.uuid4().hex[:8]}"
         self.profile = profile
         self.sensitivity = sensitivity
+        self.onStep = onStep
         self.startedAt = utcNowIso()
         self.finishedAt: str | None = None
         self.settingsHash = settingsHash()
         self.environment = collectEnvironment()
         self.steps: dict[str, dict[str, Any]] = {}
         self.artifactHashes: dict[str, Any] = {}
+        self.cacheStats: dict[str, int] = {"hits": 0, "misses": 0, "writes": 0}
         self.failureSummary: list[str] = []
         self._monotonic: dict[str, float] = {}
 
@@ -118,14 +129,16 @@ class PipelineStatus:
         outputs: list[str] | None = None,
         error: str | None = None,
         meta: dict[str, Any] | None = None,
+        elapsedMs: int | None = None,
     ) -> None:
         coerced = _coerceStatus(status)
         record = self.steps.get(name)
         if record is None:
             self.startStep(name)
 
-        started = self._monotonic.get(name)
-        elapsedMs = int((time.monotonic() - started) * 1000) if started else None
+        if elapsedMs is None:
+            started = self._monotonic.get(name)
+            elapsedMs = int((time.monotonic() - started) * 1000) if started else None
 
         outputPaths = [p for p in (outputs or []) if p]
         artifacts: dict[str, Any] = {}
@@ -149,6 +162,13 @@ class PipelineStatus:
         if coerced in {StepStatus.FAILED, StepStatus.INVALID}:
             self.failureSummary.append(f"{name}: {error or coerced.value}")
 
+        # Observability callbacks must never break the pipeline.
+        if self.onStep is not None:
+            try:
+                self.onStep(name, dict(record))
+            except Exception:
+                pass
+
     def setStep(
         self,
         name: str,
@@ -160,9 +180,14 @@ class PipelineStatus:
     ) -> None:
         """Record a completed step without a preceding startStep()."""
         self.startStep(name)
-        self.finishStep(name, status, outputs=outputs, error=error, meta=meta)
-        if elapsedMs is not None:
-            self.steps[name]["elapsedMs"] = elapsedMs
+        self.finishStep(
+            name,
+            status,
+            outputs=outputs,
+            error=error,
+            meta=meta,
+            elapsedMs=elapsedMs,
+        )
 
     def finish(self) -> None:
         self.finishedAt = utcNowIso()
@@ -186,6 +211,7 @@ class PipelineStatus:
             "environment": self.environment,
             "steps": self.steps,
             "artifactHashes": self.artifactHashes,
+            "cacheStats": self.cacheStats,
             "failureSummary": self.failureSummary,
         }
 

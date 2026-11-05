@@ -1,17 +1,33 @@
 # -*- coding: utf-8 -*-
-import sys
-import logging
-import threading
-from pathlib import Path
-from loguru import logger
-from typing import Optional, Union
-from src.log.generalConfig import GeneralConfig
-from  datetime import datetime
-import uuid
+"""Loguru logging setup for the recorder and clipping pipeline.
 
-# --- 配置参数 ---
+Two sink families are managed here:
+
+* human-readable logs — console plus a rotating ``logs/*.log`` file;
+* machine-readable events — ``logs/events.jsonl``, one JSON object per line.
+
+Event records are tagged through ``extra["event"]`` by
+:func:`src.log.events.logEvent` and are filtered out of the human sinks.  The
+same sink-registration path is used by :meth:`LoggerManager.setup` and
+:func:`setLogLevel`, so changing the level at runtime never drops the event
+stream.  Rotation and retention values come from
+:class:`src.log.generalConfig.GeneralConfig`.
+"""
+
+import logging
+import sys
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional, Union
+
+from loguru import logger
+
+from src.log.generalConfig import GeneralConfig
+
+# --- configuration ---------------------------------------------------
 LOG_DIR = Path(GeneralConfig.logFilePath)
-# 默认日志级别配置
 DEFAULT_LOG_LEVEL = GeneralConfig.defaultLogLevel
 LOG_FILE_PATH = ""
 DEFAULT_FORMAT = (
@@ -21,29 +37,151 @@ DEFAULT_FORMAT = (
     "- <lvl>{message}</lvl>"
 )
 
-# Protect logger reconfiguration from concurrent access
+# Protect logger reconfiguration from concurrent access.
 _logLock = threading.Lock()
 
 
+def _isEventRecord(record: dict[str, Any]) -> bool:
+    """Only structured events reach ``events.jsonl``."""
+    return bool(record["extra"].get("event"))
+
+
+def _isHumanRecord(record: dict[str, Any]) -> bool:
+    """Keep structured events out of the console/file logs."""
+    return not record["extra"].get("event")
+
+
 class LoggerManager:
+    """Owns the loguru sink configuration and supports level changes."""
+
     _initialized = False
+    _level: str = DEFAULT_LOG_LEVEL
+    _logPath: Path | None = None
+    _eventLogPath: Path | None = None
+    _rotation: str = GeneralConfig.logRotation
+    _retention: str = GeneralConfig.logRetention
+
     @classmethod
     def setup(
-            cls,
-            logFile: Optional[Union[str, Path]] = None,
-            level: str = DEFAULT_LOG_LEVEL,
-            rotation: str =GeneralConfig.rotation,
-            retention: str = GeneralConfig.retention,
-    ):
-        if cls._initialized:
+        cls,
+        logFile: Optional[Union[str, Path]] = None,
+        level: str = DEFAULT_LOG_LEVEL,
+        rotation: str = GeneralConfig.logRotation,
+        retention: str = GeneralConfig.logRetention,
+        eventLogFile: Optional[Union[str, Path]] = None,
+        force: bool = False,
+    ) -> None:
+        """Configure console, file and event sinks.
+
+        Args:
+            logFile: Explicit human log path; defaults to a timestamped file
+                under ``logs/``.
+            level: Minimum level for console/file sinks.
+            rotation: loguru rotation policy (size or daily ``"00:00"``).
+            retention: How long rotated log files are kept.
+            eventLogFile: Explicit JSONL event path; defaults to
+                ``logs/events.jsonl``.
+            force: Reconfigure even when ``setup()`` already ran (tests and
+                runtime level changes).
+        """
+        with _logLock:
+            if cls._initialized and not force:
+                return
+
+            resolvedLevel = cls._normaliseLevel(level)
+            logger.remove()
+            cls._installLevelIcons()
+
+            cls._level = resolvedLevel
+            cls._rotation = rotation
+            cls._retention = retention
+
+            logPath = Path(logFile) if logFile else LOG_DIR / (
+                f"{datetime.now().strftime('%Y-%m-%d-')}-{uuid.uuid4().hex}.log"
+            )
+            logPath.parent.mkdir(parents=True, exist_ok=True)
+
+            global LOG_FILE_PATH
+            LOG_FILE_PATH = str(logPath)
+            cls._logPath = logPath
+            cls._eventLogPath = (
+                Path(eventLogFile)
+                if eventLogFile is not None
+                else LOG_DIR / GeneralConfig.eventLogFileName
+            )
+
+            cls._registerSinks(resolvedLevel)
+            cls._interceptStandardLogging()
+
+            cls._initialized = True
+            logger.info(
+                f"日志系统初始化完成，日志级别: {resolvedLevel}, 日志文件: {logPath}"
+            )
+
+    @classmethod
+    def _registerSinks(cls, level: str) -> None:
+        """Register console, file and event sinks with the given level.
+
+        Called under ``_logLock`` from both :meth:`setup` and
+        :func:`setLogLevel`.  Keeping a single registration path prevents the
+        event sink from disappearing after a runtime level change.
+        """
+        logger.add(
+            sink=sys.stdout,
+            format=cls._getFormat,
+            colorize=True,
+            level=level,
+            filter=_isHumanRecord,
+            backtrace=True,
+            diagnose=True,
+        )
+
+        if cls._logPath is not None:
+            logger.add(
+                sink=cls._logPath,
+                format=cls._getFileFormat,
+                level=level,
+                filter=_isHumanRecord,
+                rotation=cls._rotation,
+                retention=cls._retention,
+                compression="zip",
+                encoding="utf-8",
+                enqueue=False,  # avoid multiprocessing queue issues
+            )
+
+        if cls._eventLogPath is None:
             return
+        try:
+            cls._eventLogPath.parent.mkdir(parents=True, exist_ok=True)
+            logger.add(
+                sink=cls._eventLogPath,
+                format="{message}",
+                level="TRACE",
+                filter=_isEventRecord,
+                rotation=GeneralConfig.eventLogRotation,
+                retention=GeneralConfig.eventLogRetention,
+                compression="zip",
+                encoding="utf-8",
+                enqueue=False,
+            )
+        except OSError as exc:
+            print(
+                f"[logger] event log disabled ({cls._eventLogPath}): {exc}",
+                file=sys.stderr,
+            )
 
-        # 1. 移除默认配置
-        logger.remove()
+    @staticmethod
+    def _normaliseLevel(level: str) -> str:
+        normalised = str(level or DEFAULT_LOG_LEVEL).strip().upper()
+        try:
+            logger.level(normalised)
+        except ValueError as exc:
+            raise ValueError(f"unknown log level: {level!r}") from exc
+        return normalised
 
-        # 2. 覆盖自定义 Level 的图标 (直接注入 loguru)
-        # 这样在 format 中直接使用 {level.icon} 或 <lvl> 即可
-        # 避免控制台编码问题，使用 ASCII 图标
+    @staticmethod
+    def _installLevelIcons() -> None:
+        """Attach icons used by the console formatter."""
         logger.level("TRACE", icon="🔍")
         logger.level("DEBUG", icon="🐛")
         logger.level("INFO", icon="ℹ️")
@@ -52,72 +190,24 @@ class LoggerManager:
         logger.level("ERROR", icon="❌")
         logger.level("CRITICAL", icon="🔥")
 
-        # 3. 添加控制台输出
-        logger.add(
-            sink=sys.stdout,
-            format=cls._getFormat,
-            colorize=True,
-            level=level,
-            backtrace=True,
-            diagnose=True,
-        )
-
-        # 4. 添加文件输出
-        if logFile:
-            logPath = Path(logFile)
-        else:
-            # 使用默认的日志目录
-            logPath = LOG_DIR /  f"{datetime.now().strftime('%Y-%m-%d-')}-{uuid.uuid4().hex}.log"
-        
-        logPath.parent.mkdir(parents=True, exist_ok=True)
-
-        # 保存日志文件路径到全局变量
-        global LOG_FILE_PATH
-        LOG_FILE_PATH = logPath
-
-        logger.add(
-            sink=logPath,
-            format=cls._getFileFormat,  # 文件输出使用更简洁的文本格式
-            level=level,
-            rotation=rotation,
-            retention=retention,
-            compression="zip",
-            encoding="utf-8",
-            enqueue=False,  # 避免多进程队列在受限环境下报错
-        )
-
-        # 5. 拦截标准 logging 库日志
-        cls._interceptStandardLogging()
-
-        cls._initialized = True
-        logger.info(f"日志系统初始化完成，日志级别: {level}, 日志文件: {logPath}")
-
     @staticmethod
     def _getFormat(record):
-        """
-        动态构建控制台日志格式，利用已定义的 level icon
-        """
-        # 在 extra 中添加默认 module_name 防止报错
+        """Build the console format, truncating noisy fields."""
         if "module_name" not in record["extra"]:
             record["extra"]["module_name"] = record["name"]
 
         icon = record["level"].icon
-
-        # 截断 module_name 和 function 字段，保持输出整齐
         maxModuleNameLength = 15
         maxFunctionLength = 18
 
-        # 截断 module_name
         moduleName = record["extra"].get("module_name", "")
         if len(moduleName) > maxModuleNameLength:
             record["extra"]["module_name"] = moduleName[:maxModuleNameLength - 3] + "..."
 
-        # 截断 function
         function = record.get("function", "")
         if len(function) > maxFunctionLength:
             record["function"] = function[:maxFunctionLength - 3] + "..."
 
-        # 这里的 <lvl> 会自动根据级别应用 loguru 内置颜色
         return (
             "<bold><green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green></bold> "
             "<bold>│</bold> "
@@ -130,28 +220,21 @@ class LoggerManager:
 
     @staticmethod
     def _getFileFormat(record):
-        """
-        动态构建文件日志格式，不包含颜色代码
-        """
-        # 在 extra 中添加默认 module_name 防止报错
+        """Build the plain-text file format (no ANSI colours)."""
         if "module_name" not in record["extra"]:
             record["extra"]["module_name"] = record["name"]
 
-        # 截断 module_name 和 function 字段，保持输出整齐
         maxModuleNameLength = 15
         maxFunctionLength = 18
 
-        # 截断 module_name
         moduleName = record["extra"].get("module_name", "")
         if len(moduleName) > maxModuleNameLength:
             record["extra"]["module_name"] = moduleName[:maxModuleNameLength - 3] + "..."
 
-        # 截断 function
         function = record.get("function", "")
         if len(function) > maxFunctionLength:
             record["function"] = function[:maxFunctionLength - 3] + "..."
 
-        # 文件输出不使用颜色代码
         return (
             "{time:YYYY-MM-DD HH:mm:ss.SSS} | "
             "{level: <10} | "
@@ -160,10 +243,9 @@ class LoggerManager:
         )
 
     @staticmethod
-    def _interceptStandardLogging():
-        """让标准库 logging 的日志也通过 loguru 输出，但过滤掉不需要的日志"""
+    def _interceptStandardLogging() -> None:
+        """Route standard-library warnings through loguru, filtering noise."""
 
-        # 定义要过滤的日志来源（这些日志通常来自第三方库，比较嘈杂）
         FILTERED_LOGGERS = {
             'huggingface_hub',
             'urllib3',
@@ -179,15 +261,15 @@ class LoggerManager:
 
         class InterceptHandler(logging.Handler):
             def emit(self, record):
-                # 过滤特定来源的日志
-                if record.name in FILTERED_LOGGERS or any(record.name.startswith(f"{prefix}.") for prefix in FILTERED_LOGGERS):
+                if record.name in FILTERED_LOGGERS or any(
+                    record.name.startswith(f"{prefix}.") for prefix in FILTERED_LOGGERS
+                ):
                     return
-                
-                # 过滤包含特定关键字的日志（如 HTTP 请求）
+
                 message = record.getMessage()
                 if 'HTTP Request:' in message or 'HEAD' in message or 'GET' in message:
                     return
-                
+
                 try:
                     level = logger.level(record.levelname).name
                 except ValueError:
@@ -198,68 +280,37 @@ class LoggerManager:
                     depth += 1
                 logger.opt(depth=depth, exception=record.exc_info).log(level, message)
 
-        # 只拦截 WARNING 级别及以上的日志，减少噪音
+        # Only intercept WARNING and above to keep third-party noise out.
         logging.basicConfig(handlers=[InterceptHandler()], level=logging.WARNING)
 
 
 def getLogger(name: Optional[str] = None):
-    """
-    获取 logger。建议在每个文件开头使用：log = getLogger(__name__)
-    """
-    # 确保已经初始化（如果不手动调用 setup，这里可以给个默认值）
+    """Return a logger bound to ``name`` for formatted module output."""
     if not LoggerManager._initialized:
-        # 从配置中获取日志级别
         LoggerManager.setup(level=GeneralConfig.defaultLogLevel)
 
-    # 使用 bind 将模块名绑定到 extra，方便 format 读取
     return logger.bind(module_name=name or "Main")
 
 
 def setLogLevel(level: str):
-    """
-    动态设置日志级别（线程安全）
+    """Change the console/file log level without dropping the event sink.
 
     Args:
-        level: 日志级别，可选值：TRACE, DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL
+        level: TRACE, DEBUG, INFO, SUCCESS, WARNING, ERROR or CRITICAL.
     """
-    global LOG_FILE_PATH
+    if not LoggerManager._initialized:
+        LoggerManager.setup(level=level)
+        return
+
     with _logLock:
-        # 移除所有现有的处理器
+        resolvedLevel = LoggerManager._normaliseLevel(level)
         logger.remove()
+        LoggerManager._installLevelIcons()
+        LoggerManager._level = resolvedLevel
+        LoggerManager._registerSinks(resolvedLevel)
 
-        # 重新设置图标（保持与初始化一致的 ASCII 风格）
-        logger.level("TRACE", icon="🔍")
-        logger.level("DEBUG", icon="🐛")
-        logger.level("INFO", icon="ℹ️")
-        logger.level("SUCCESS", icon="✅")
-        logger.level("WARNING", icon="⚠️")
-        logger.level("ERROR", icon="❌")
-        logger.level("CRITICAL", icon="🔥")
+    logger.info(f"日志级别已设置为: {resolvedLevel}")
 
-        # 重新添加控制台输出
-        logger.add(
-            sink=sys.stdout,
-            format=LoggerManager._getFormat,
-            colorize=True,
-            level=level,
-            backtrace=True,
-            diagnose=True,
-        )
 
-        # 重新添加文件输出（如果之前有）
-        if LOG_FILE_PATH:
-            logger.add(
-                sink=LOG_FILE_PATH,
-                format=LoggerManager._getFileFormat,
-                level=level,
-                rotation="10 MB",
-                retention="7 days",
-                compression="zip",
-                encoding="utf-8",
-                enqueue=True,
-            )
-
-    logger.info(f"日志级别已设置为: {level}")
-
-# 初始化日志系统
+# Initialise on import so every module gets the same sink configuration.
 LoggerManager.setup()

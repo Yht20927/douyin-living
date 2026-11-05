@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = "1.0"
-GENERATOR_VERSION = "sprint3"
+GENERATOR_VERSION = "sprint4"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _PROJECT_ROOT / "config"
@@ -267,6 +267,80 @@ class RecordingMeta:
             return None
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+# ── artifact cache metadata ──────────────────────────────────────
+
+
+def fingerprintMatches(
+    recorded: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> bool:
+    """Return True when two ``artifactFingerprint`` results describe the same file.
+
+    Small artifacts carry a SHA-256, which is authoritative.  Large media
+    files skip hashing, so size + mtime are used as a cheap identity check.
+    """
+    if not recorded or not current:
+        return False
+    if recorded.get("sizeBytes") != current.get("sizeBytes"):
+        return False
+    recordedSha = recorded.get("sha256")
+    currentSha = current.get("sha256")
+    if recordedSha and currentSha:
+        return recordedSha == currentSha
+    return recorded.get("mtimeNs") == current.get("mtimeNs")
+
+
+def artifactMetaPath(path: str | os.PathLike[str]) -> str:
+    """Return the sidecar metadata path for an artifact.
+
+    ``audio.aac`` → ``audio.aac.meta.json``.  Keeping the suffix after the
+    full artifact name avoids collisions between e.g. ``asr.json`` and
+    ``asr.json.meta.json``.
+    """
+    return f"{path}.meta.json"
+
+
+@dataclass
+class ArtifactMeta:
+    """Cache contract for one intermediate pipeline artifact."""
+
+    artifactPath: str
+    step: str
+    sourceHashes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    settingsHash: str = ""
+    paramsHash: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    artifact: dict[str, Any] = field(default_factory=dict)
+    generatedAt: str = field(default_factory=utcNowIso)
+    elapsedMs: int | None = None
+    schemaVersion: str = SCHEMA_VERSION
+    generatorVersion: str = GENERATOR_VERSION
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def toDict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def save(self, path: str | os.PathLike[str] | None = None) -> str:
+        target = path if path is not None else artifactMetaPath(self.artifactPath)
+        atomicWriteJson(target, self.toDict())
+        return str(target)
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str]) -> "ArtifactMeta | None":
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        try:
+            return cls(**{k: v for k, v in data.items() if k in known})
+        except (TypeError, ValueError):
+            return None
 
 
 # ── feature artifact inspection ──────────────────────────────────

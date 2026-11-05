@@ -28,20 +28,64 @@ from src.roomApi import RoomApi
 from src.danmakuWs import DanmakuWs
 from src.flvRecorder import FlvRecorder
 from src.protobuf.Live_pb2 import LiveResponse
+from src.log.events import logEvent
 from src.log.logger import getLogger
 from src.util import fmtSize
 from src.config import load_settings
 from src.contracts import (
     RecordingMeta,
     artifactFingerprint,
+    artifactMetaPath,
     inspectAsrArtifact,
     inspectFeatureArtifact,
     probeMedia,
 )
-from src.pipeline import PipelineStatus, StepStatus
+from src.pipeline import ArtifactCache, CacheDecision, PipelineStatus, StepStatus
 
 log = getLogger(__name__)
 _cfg = load_settings().pipeline
+
+# Canonical resumable pipeline stages, in execution order.  Physical status
+# steps (1_audio_extract, 4_audio_signal, ...) map onto these groups.
+STEP_ORDER = ("audio", "asr", "signal", "score", "clip")
+
+_STEP_ALIASES = {
+    "audio": "audio",
+    "audio_extract": "audio",
+    "1_audio_extract": "audio",
+    "asr": "asr",
+    "2_asr": "asr",
+    "signal": "signal",
+    "signals": "signal",
+    "3_signal": "signal",
+    "4_audio_signal": "signal",
+    "5_text_signal": "signal",
+    "6_visual_signal": "signal",
+    "score": "score",
+    "scorer": "score",
+    "7_scorer": "score",
+    "clip": "clip",
+    "clips": "clip",
+    "clipping": "clip",
+    "8_clipping": "clip",
+    "9_subtitles_thumbnails": "clip",
+}
+
+
+def normalizeStepName(value: str | None) -> str | None:
+    """Map CLI/status step names onto a canonical resumable stage."""
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if not key:
+        return None
+    try:
+        return _STEP_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown pipeline step: {value!r}; expected one of {', '.join(STEP_ORDER)}"
+        ) from exc
+
 
 
 class Controller:
@@ -66,6 +110,9 @@ class Controller:
         resolution: str | None = None,
         dryRun: bool = False,
         outputDir: str | None = None,
+        force: bool = False,
+        fromStep: str | None = None,
+        onlyStep: str | None = None,
     ):
         self.webRid = webRid
         self.clip = clip
@@ -78,6 +125,12 @@ class Controller:
         self.resolution = resolution or _cfg.resolution_default
         self.dryRun = dryRun
         self.outputDir = outputDir or os.path.join("data", webRid)
+        self.force = force
+        self.fromStep = normalizeStepName(fromStep)
+        self.onlyStep = normalizeStepName(onlyStep)
+        if self.onlyStep and not self.fromStep:
+            self.fromStep = self.onlyStep
+        self._artifactCache: ArtifactCache | None = None
 
         self._auth: Auth | None = None
         self._danmakuWs: DanmakuWs | None = None
@@ -95,6 +148,69 @@ class Controller:
         self._danmakuQueue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._writerThread: threading.Thread | None = None
         self._writerStop = threading.Event()
+
+    # ── cache / resume helpers ─────────────────────────────────
+
+    @property
+    def _cache(self) -> ArtifactCache:
+        if self._artifactCache is None:
+            self._artifactCache = ArtifactCache()
+        return self._artifactCache
+
+    def _shouldRebuild(self, step: str) -> bool:
+        """True when ``--force`` or ``--from-step`` invalidates this stage."""
+        canonical = normalizeStepName(step)
+        if self.force:
+            return True
+        if self.fromStep and canonical:
+            return STEP_ORDER.index(canonical) >= STEP_ORDER.index(self.fromStep)
+        return False
+
+    def _stopAfter(self, step: str) -> bool:
+        """True when ``--only-step`` names this canonical stage."""
+        return self.onlyStep is not None and self.onlyStep == normalizeStepName(step)
+
+    def _checkCache(
+        self,
+        stepName: str,
+        artifactPath: str,
+        inputs: list[str],
+        params: dict[str, Any] | None = None,
+        validator=None,
+    ) -> CacheDecision:
+        """Cache lookup honouring force/from-step; validators check schema."""
+        if self._shouldRebuild(stepName):
+            self._cache.misses += 1
+            return CacheDecision(False, "forced rebuild")
+        return self._cache.check(
+            artifactPath,
+            stepName,
+            inputs,
+            params=params,
+            validator=validator,
+        )
+
+    @staticmethod
+    def _cacheInfo(decision: CacheDecision) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "reused": decision.hit,
+            "cacheReason": decision.reason,
+        }
+        if decision.meta is not None:
+            info["metaPath"] = artifactMetaPath(decision.meta.artifactPath)
+            info["generatedAt"] = decision.meta.generatedAt
+            if decision.meta.elapsedMs is not None:
+                info["elapsedMs"] = decision.meta.elapsedMs
+        return info
+
+    @staticmethod
+    def _loadJsonDict(path: str) -> dict[str, Any] | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # ── start / stop ───────────────────────────────────────────
 
@@ -316,15 +432,57 @@ class Controller:
         """
         log.info("=" * 50)
         log.info("Starting AI clipping pipeline")
+        log.info(
+            "Options: force={} fromStep={} onlyStep={}",
+            self.force,
+            self.fromStep,
+            self.onlyStep,
+        )
         log.info("=" * 50)
         os.makedirs(self.outputDir, exist_ok=True)
+        self._artifactCache = ArtifactCache()
+        runStartedAt = time.monotonic()
 
         statusPath = os.path.join(self.outputDir, "pipeline_status.json")
+
+        def _onStep(name: str, record: dict[str, Any]) -> None:
+            """Mirror every completed step into the structured event log."""
+            meta = record.get("meta") or {}
+            extra: dict[str, Any] = {}
+            if meta.get("reused") is not None:
+                extra["reused"] = bool(meta["reused"])
+            if meta.get("cacheReason"):
+                extra["cacheReason"] = meta["cacheReason"]
+            if record.get("error"):
+                extra["error"] = record["error"]
+            logEvent(
+                "pipeline.step",
+                runId=status.runId,
+                roomId=self.webRid,
+                step=name,
+                status=record.get("status"),
+                elapsedMs=record.get("elapsedMs"),
+                **extra,
+            )
+
         status = PipelineStatus(
             roomId=self.webRid,
             outputDir=self.outputDir,
             profile=self.profile,
             sensitivity=self.sensitivity,
+            onStep=_onStep,
+        )
+        logEvent(
+            "pipeline.start",
+            runId=status.runId,
+            roomId=self.webRid,
+            status="running",
+            outputDir=self.outputDir,
+            profile=self.profile,
+            sensitivity=self.sensitivity,
+            force=self.force,
+            fromStep=self.fromStep,
+            onlyStep=self.onlyStep,
         )
         try:
             await self._runClippingPipelineInner(status)
@@ -336,8 +494,21 @@ class Controller:
                 error=f"{type(exc).__name__}: {exc}",
             )
         finally:
+            status.cacheStats = self._cache.stats()
             status.save(statusPath)
+            logEvent(
+                "pipeline.finish",
+                runId=status.runId,
+                roomId=self.webRid,
+                status="failed" if status.hasFailures() else "ok",
+                elapsedMs=int((time.monotonic() - runStartedAt) * 1000),
+                failures=len(status.failureSummary),
+                cacheHits=status.cacheStats.get("hits", 0),
+                cacheMisses=status.cacheStats.get("misses", 0),
+                cacheWrites=status.cacheStats.get("writes", 0),
+            )
             log.info(f"Pipeline status: {statusPath}")
+            log.info(f"Artifact cache: {status.cacheStats}")
 
     async def _runClippingPipelineInner(self, status: PipelineStatus):
         """Actual pipeline body — always called under status accounting."""
@@ -394,16 +565,29 @@ class Controller:
 
         # ── Step 1: Extract audio ──────────────────────────────
         status.startStep("1_audio_extract", inputs=[videoPath])
-        if os.path.exists(audioPath):
-            log.info("Step 1: Audio exists, reusing")
+        audioParams = {"codec": "copy"}
+        audioDecision = self._checkCache(
+            "1_audio_extract",
+            audioPath,
+            [videoPath],
+            params=audioParams,
+            validator=lambda: (
+                os.path.exists(audioPath) and os.path.getsize(audioPath) > 0,
+                "cached audio is missing or empty",
+            ),
+        )
+        if audioDecision.hit:
+            log.info(f"Step 1: audio cache hit → {audioPath}")
             status.finishStep(
                 "1_audio_extract",
                 StepStatus.SKIPPED,
                 outputs=[audioPath],
-                meta={"reused": True},
+                meta=self._cacheInfo(audioDecision),
             )
         else:
-            log.info("Step 1: Extracting audio...")
+            log.info(f"Step 1: {audioDecision.reason} — extracting audio")
+            self._cache.invalidate(audioPath)
+            startedAt = time.monotonic()
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-i", videoPath, "-vn", "-acodec", "copy", "-y", audioPath,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
@@ -418,8 +602,26 @@ class Controller:
                     error=err or "ffmpeg produced no audio file",
                 )
                 return
+            elapsedMs = int((time.monotonic() - startedAt) * 1000)
+            self._cache.record(
+                audioPath,
+                "1_audio_extract",
+                [videoPath],
+                params=audioParams,
+                elapsedMs=elapsedMs,
+                extra={"sizeBytes": os.path.getsize(audioPath)},
+            )
             log.info(f"Audio: {audioPath}")
-            status.finishStep("1_audio_extract", StepStatus.OK, outputs=[audioPath])
+            status.finishStep(
+                "1_audio_extract",
+                StepStatus.OK,
+                outputs=[audioPath],
+                meta={
+                    "reused": False,
+                    "cacheReason": audioDecision.reason,
+                    "elapsedMs": elapsedMs,
+                },
+            )
 
         # Probe the real media duration and persist the recording contract.
         recordingMeta = await self._writeRecordingMeta(
@@ -431,58 +633,142 @@ class Controller:
         )
         log.info(f"Recording duration: {durationSec:.1f}s")
 
+        if self._stopAfter("audio"):
+            log.info("--only-step audio: stopping before ASR")
+            return
+
         # ── Step 2: ASR + diarization ──────────────────────────
         log.info("Step 2: ASR...")
         asrPath = audioPath.rsplit(".", 1)[0] + "_asr.json"
+        asrParams = {
+            "model": _cfg.asr_model,
+            "computeType": _cfg.asr_compute_type,
+            "diarize": _cfg.asr_diarize,
+        }
         status.startStep("2_asr", inputs=[audioPath])
-        if os.path.exists(asrPath):
+
+        def _asrValidator() -> tuple[bool, str]:
+            info = inspectAsrArtifact(asrPath)
+            if info["status"] in {"ok", "empty"}:
+                return True, "cache hit"
+            return False, f"previous ASR artifact is {info['status']}"
+
+        asrDecision = self._checkCache(
+            "2_asr",
+            asrPath,
+            [audioPath],
+            params=asrParams,
+            validator=_asrValidator,
+        )
+        if asrDecision.hit:
             asrInfo = inspectAsrArtifact(asrPath)
-            log.info(f"ASR exists: {asrPath} (status={asrInfo['status']})")
+            log.info(f"Step 2: ASR cache hit → {asrPath} (status={asrInfo['status']})")
             status.finishStep(
                 "2_asr",
-                asrInfo["status"],
+                StepStatus.SKIPPED,
                 outputs=[asrPath],
                 error="; ".join(asrInfo["errors"]) or None,
                 meta={
-                    "reused": True,
+                    **self._cacheInfo(asrDecision),
+                    "asrStatus": asrInfo["status"],
                     "segments": asrInfo["segments"],
                     "duration": asrInfo["duration"],
                 },
             )
-            if asrInfo["status"] == "failed":
-                log.warning(
-                    "ASR was previously marked failed — delete the ASR JSON to retry"
-                )
         else:
+            log.info(f"Step 2: {asrDecision.reason} — running ASR")
+            self._cache.invalidate(asrPath)
+            startedAt = time.monotonic()
             try:
                 from asr import transcribe
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                log.info(f"ASR device: {device}")
+                device = _cfg.asr_device
+                if device == "auto":
+                    import torch
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                elif device == "cuda":
+                    import torch
+                    if not torch.cuda.is_available():
+                        log.warning(
+                            "ASR device=cuda requested but CUDA is unavailable "
+                            "— falling back to CPU"
+                        )
+                        device = "cpu"
+                log.info(
+                    f"ASR model: {_cfg.asr_model}, device: {device}, "
+                    f"compute: {_cfg.asr_compute_type}, diarize: {_cfg.asr_diarize}"
+                )
                 # Offload blocking ASR to thread pool so the event loop stays alive
                 await asyncio.to_thread(
-                    transcribe, audioPath, device=device, diarize=True,
+                    transcribe,
+                    audioPath,
+                    modelSize=_cfg.asr_model,
+                    device=device,
+                    computeType=_cfg.asr_compute_type,
+                    diarize=_cfg.asr_diarize,
                     outputPath=asrPath,
                 )
                 asrInfo = inspectAsrArtifact(asrPath)
+                elapsedMs = int((time.monotonic() - startedAt) * 1000)
+                self._cache.record(
+                    asrPath,
+                    "2_asr",
+                    [audioPath],
+                    params=asrParams,
+                    elapsedMs=elapsedMs,
+                    extra={
+                        "status": asrInfo["status"],
+                        "segments": asrInfo["segments"],
+                    },
+                )
+                stepStatus = (
+                    StepStatus.FAILED
+                    if asrInfo["status"] == "missing"
+                    else asrInfo["status"]
+                )
                 status.finishStep(
                     "2_asr",
-                    asrInfo["status"],
+                    stepStatus,
                     outputs=[asrPath],
                     error="; ".join(asrInfo["errors"]) or None,
-                    meta={"segments": asrInfo["segments"]},
+                    meta={
+                        "segments": asrInfo["segments"],
+                        "duration": asrInfo["duration"],
+                        "reused": False,
+                        "cacheReason": asrDecision.reason,
+                        "elapsedMs": elapsedMs,
+                    },
                 )
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+                elapsedMs = int((time.monotonic() - startedAt) * 1000)
                 log.warning(f"ASR failed — marking as unavailable: {err}", exc_info=True)
                 with open(asrPath, "w", encoding="utf-8") as f:
                     json.dump({"status": "failed", "segments": [], "error": err}, f)
+                # Record the failed attempt too: the validator will reject it
+                # next run, but the sidecar keeps timing/version diagnostics.
+                self._cache.record(
+                    asrPath,
+                    "2_asr",
+                    [audioPath],
+                    params=asrParams,
+                    elapsedMs=elapsedMs,
+                    extra={"status": "failed", "error": err},
+                )
                 status.finishStep(
                     "2_asr",
                     StepStatus.FAILED,
                     outputs=[asrPath],
                     error=err,
+                    meta={
+                        "reused": False,
+                        "cacheReason": asrDecision.reason,
+                        "elapsedMs": elapsedMs,
+                    },
                 )
+
+        if self._stopAfter("asr"):
+            log.info("--only-step asr: stopping before signal extraction")
+            return
 
         # Step 3: Preprocess (auto-editor, optional)
         # Skipped in Phase 1 — requires --preprocess flag
@@ -513,33 +799,63 @@ class Controller:
             ("5_text_signal", textFeatPath, [danmakuPath, asrPath], _runText),
             ("6_visual_signal", visualFeatPath, [videoPath], _runVisual),
         ]
+        signalParams = {
+            "durationSec": round(float(durationSec), 3) if durationSec else None,
+        }
         signalErrors: dict[str, str] = {}
         artifactStatus: dict[str, str] = {}
         futures: dict[str, Any] = {}
+        decisionByStep: dict[str, CacheDecision] = {}
+        elapsedByStep: dict[str, int] = {}
+
+        def _timed(stepName: str, runner, *args):
+            startedAt = time.monotonic()
+            try:
+                return runner(*args)
+            finally:
+                elapsedByStep[stepName] = int((time.monotonic() - startedAt) * 1000)
+
+        def _featureValidator(outPath: str):
+            def _validate() -> tuple[bool, str]:
+                info = inspectFeatureArtifact(outPath)
+                if info["status"] == "ok":
+                    return True, "cache hit"
+                detail = "; ".join(info["errors"]) or info["status"]
+                return False, f"feature artifact is {info['status']} ({detail})"
+
+            return _validate
 
         with ThreadPoolExecutor(max_workers=_cfg.signal_pool_workers) as pool:
             for stepName, outPath, inputs, runner in signalSpecs:
-                if os.path.exists(outPath):
+                decision = self._checkCache(
+                    stepName,
+                    outPath,
+                    inputs,
+                    params=signalParams,
+                    validator=_featureValidator(outPath),
+                )
+                if decision.hit:
                     info = inspectFeatureArtifact(outPath)
-                    if info["status"] == "ok":
-                        log.info(f"  {stepName}: valid artifact exists, reusing")
-                        artifactStatus[stepName] = "ok"
-                        status.setStep(
-                            stepName,
-                            StepStatus.SKIPPED,
-                            outputs=[outPath],
-                            meta={
-                                "reused": True,
-                                "featureCount": info["featureCount"],
-                                "duration": info["duration"],
-                            },
-                        )
-                        continue
-                    log.warning(
-                        f"  {stepName}: existing artifact is {info['status']} "
-                        f"({'; '.join(info['errors'])}) — regenerating"
+                    log.info(
+                        f"  {stepName}: cache hit "
+                        f"({info['featureCount']} features, {info['duration']:.1f}s)"
                     )
+                    artifactStatus[stepName] = "ok"
+                    status.setStep(
+                        stepName,
+                        StepStatus.SKIPPED,
+                        outputs=[outPath],
+                        meta={
+                            **self._cacheInfo(decision),
+                            "featureCount": info["featureCount"],
+                            "duration": info["duration"],
+                            "featureNames": info["featureNames"],
+                        },
+                    )
+                    continue
 
+                log.info(f"  {stepName}: {decision.reason} — extracting")
+                decisionByStep[stepName] = decision
                 missing = [p for p in inputs if not os.path.exists(p)]
                 if missing:
                     reason = "missing inputs: " + ", ".join(missing)
@@ -550,14 +866,22 @@ class Controller:
                     continue
 
                 status.startStep(stepName, inputs=inputs)
+                self._cache.invalidate(outPath)
                 if stepName == "4_audio_signal":
-                    futures[stepName] = pool.submit(runner, inputs[0], outPath)
+                    futures[stepName] = pool.submit(
+                        _timed, stepName, runner, inputs[0], outPath
+                    )
                 elif stepName == "5_text_signal":
-                    futures[stepName] = pool.submit(runner, inputs[0], inputs[1], outPath)
+                    futures[stepName] = pool.submit(
+                        _timed, stepName, runner, inputs[0], inputs[1], outPath
+                    )
                 else:
-                    futures[stepName] = pool.submit(runner, inputs[0], outPath)
+                    futures[stepName] = pool.submit(
+                        _timed, stepName, runner, inputs[0], outPath
+                    )
 
             outPathByStep = {name: out for name, out, _, _ in signalSpecs}
+            inputsByStep = {name: inputs for name, _, inputs, _ in signalSpecs}
             for stepName, future in futures.items():
                 outPath = outPathByStep[stepName]
                 try:
@@ -572,6 +896,19 @@ class Controller:
 
                 info = inspectFeatureArtifact(outPath)
                 artifactStatus[stepName] = info["status"]
+                elapsedMs = elapsedByStep.get(stepName)
+                if info["status"] != "missing":
+                    self._cache.record(
+                        outPath,
+                        stepName,
+                        inputsByStep[stepName],
+                        params=signalParams,
+                        elapsedMs=elapsedMs,
+                        extra={
+                            "status": info["status"],
+                            "featureCount": info["featureCount"],
+                        },
+                    )
                 stepStatus = (
                     StepStatus.FAILED if info["status"] == "missing" else info["status"]
                 )
@@ -584,8 +921,17 @@ class Controller:
                         "featureCount": info["featureCount"],
                         "duration": info["duration"],
                         "featureNames": info["featureNames"],
+                        "reused": False,
+                        "cacheReason": decisionByStep.get(
+                            stepName, CacheDecision(False, "rebuilt")
+                        ).reason,
+                        "elapsedMs": elapsedMs,
                     },
                 )
+
+        if self._stopAfter("signal"):
+            log.info("--only-step signal: stopping before scoring")
+            return
 
         # Load only artifacts that passed validation.  An empty/invalid file
         # is never handed to the scorer as if it were a real signal.
@@ -612,44 +958,110 @@ class Controller:
         log.info("Step 7: Scoring...")
         timeTablePath = os.path.join(self.outputDir, "time_table.json")
         scoresPath = os.path.join(self.outputDir, "scores.json")
-        from src.scorer import score
-        status.startStep(
-            "7_scorer",
-            inputs=[audioFeatPath, textFeatPath, visualFeatPath],
-        )
-        try:
-            result = score(
-                roomId=self.webRid,
-                audioFeatures=audioFeat,
-                textFeatures=textFeat,
-                visualFeatures=visualFeat,
-                profile=self.profile,
-                sensitivity=self.sensitivity,
-                minDuration=self.minDuration,
-                maxDuration=self.maxDuration,
-                durationSec=durationSec or None,
-                outputPath=timeTablePath,
-                scoresPath=scoresPath,
+        scoringInputs = [
+            path
+            for path, stepName in (
+                (audioFeatPath, "4_audio_signal"),
+                (textFeatPath, "5_text_signal"),
+                (visualFeatPath, "6_visual_signal"),
             )
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            log.exception("Scoring failed")
-            status.finishStep("7_scorer", StepStatus.FAILED, error=err)
-            return
+            if artifactStatus.get(stepName) == "ok"
+        ]
+        scoreParams = {
+            "profile": self.profile,
+            "sensitivity": self.sensitivity,
+            "minDuration": self.minDuration,
+            "maxDuration": self.maxDuration,
+            "durationSec": round(float(durationSec), 3) if durationSec else None,
+        }
 
-        clips = result.get("clips") or []
-        status.finishStep(
+        def _timeTableValidator() -> tuple[bool, str]:
+            if not os.path.exists(scoresPath):
+                return False, "scores.json is missing"
+            data = self._loadJsonDict(timeTablePath)
+            if data is None or not isinstance(data.get("clips"), list):
+                return False, "time_table.json is unreadable"
+            return True, "cache hit"
+
+        scoreDecision = self._checkCache(
             "7_scorer",
-            StepStatus.OK if clips else StepStatus.EMPTY,
-            outputs=[timeTablePath, scoresPath],
-            error=None if clips else "no candidate clips survived detection",
-            meta={
-                "clips": len(clips),
-                "dropped": len(result.get("dropped") or []),
-                "adjustments": len(result.get("adjustments") or []),
-                "alignedSignals": len(result.get("alignment") or []),
-            },
+            timeTablePath,
+            scoringInputs,
+            params=scoreParams,
+            validator=_timeTableValidator,
         )
+        if scoreDecision.hit:
+            result = self._loadJsonDict(timeTablePath) or {"clips": []}
+            clips = result.get("clips") or []
+            log.info(f"Step 7: scoring cache hit ({len(clips)} clips)")
+            status.setStep(
+                "7_scorer",
+                StepStatus.SKIPPED if clips else StepStatus.EMPTY,
+                outputs=[timeTablePath, scoresPath],
+                error=None if clips else "no candidate clips survived detection",
+                meta={
+                    **self._cacheInfo(scoreDecision),
+                    "clips": len(clips),
+                    "dropped": len(result.get("dropped") or []),
+                    "adjustments": len(result.get("adjustments") or []),
+                    "alignedSignals": len(result.get("alignment") or []),
+                },
+            )
+        else:
+            log.info(f"Step 7: {scoreDecision.reason} — scoring")
+            self._cache.invalidate(timeTablePath)
+            from src.scorer import score
+            status.startStep("7_scorer", inputs=scoringInputs)
+            startedAt = time.monotonic()
+            try:
+                result = score(
+                    roomId=self.webRid,
+                    audioFeatures=audioFeat,
+                    textFeatures=textFeat,
+                    visualFeatures=visualFeat,
+                    profile=self.profile,
+                    sensitivity=self.sensitivity,
+                    minDuration=self.minDuration,
+                    maxDuration=self.maxDuration,
+                    durationSec=durationSec or None,
+                    outputPath=timeTablePath,
+                    scoresPath=scoresPath,
+                )
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                log.exception("Scoring failed")
+                status.finishStep("7_scorer", StepStatus.FAILED, error=err)
+                return
+
+            elapsedMs = int((time.monotonic() - startedAt) * 1000)
+            clips = result.get("clips") or []
+            self._cache.record(
+                timeTablePath,
+                "7_scorer",
+                scoringInputs,
+                params=scoreParams,
+                elapsedMs=elapsedMs,
+                extra={
+                    "clips": len(clips),
+                    "dropped": len(result.get("dropped") or []),
+                    "adjustments": len(result.get("adjustments") or []),
+                },
+            )
+            status.finishStep(
+                "7_scorer",
+                StepStatus.OK if clips else StepStatus.EMPTY,
+                outputs=[timeTablePath, scoresPath],
+                error=None if clips else "no candidate clips survived detection",
+                meta={
+                    "clips": len(clips),
+                    "dropped": len(result.get("dropped") or []),
+                    "adjustments": len(result.get("adjustments") or []),
+                    "alignedSignals": len(result.get("alignment") or []),
+                    "reused": False,
+                    "cacheReason": scoreDecision.reason,
+                    "elapsedMs": elapsedMs,
+                },
+            )
 
         if not clips:
             log.warning("No clips detected — see time_table.json dropped reasons")
@@ -660,10 +1072,19 @@ class Controller:
             )
             return
 
+        if self._stopAfter("score"):
+            log.info("--only-step score: stopping before clipping")
+            return
+
         # ── Step 8: Clipping ───────────────────────────────────
         log.info("Step 8: Clipping video...")
         highlightsDir = os.path.join(self.outputDir, "highlights")
-        from src.clipper import clipVideo, extractThumbnail, generateClipSrt
+        from src.clipper import (
+            clipOutputPath,
+            clipVideo,
+            extractThumbnail,
+            generateClipSrt,
+        )
         status.startStep("8_clipping", inputs=[videoPath, timeTablePath])
         if self.dryRun:
             log.info("--dry-run mode: skipping video cutting")
@@ -676,25 +1097,104 @@ class Controller:
             log.info(f"Scores timeline saved: {scoresPath}")
             return
 
-        try:
-            # Offload blocking ffmpeg calls to thread pool
-            clipPaths = await asyncio.to_thread(
-                clipVideo, videoPath, timeTablePath, highlightsDir,
-                dryRun=False, resolution=self.resolution,
+        clipInputs = [videoPath, timeTablePath]
+        expectedClips = [
+            clip
+            for clip in clips
+            if float(clip.get("end", 0)) - float(clip.get("start", 0)) >= 1.0
+        ]
+
+        def _clipParams(clip: dict) -> dict[str, Any]:
+            return {
+                "resolution": self.resolution,
+                "start": clip.get("start"),
+                "end": clip.get("end"),
+                "trigger": clip.get("trigger"),
+            }
+
+        if not expectedClips:
+            status.finishStep(
+                "8_clipping",
+                StepStatus.EMPTY,
+                error="all candidate clips are shorter than 1s",
             )
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            log.exception("Video clipping failed")
-            status.finishStep("8_clipping", StepStatus.FAILED, error=err)
             return
 
-        status.finishStep(
-            "8_clipping",
-            StepStatus.OK if clipPaths else StepStatus.EMPTY,
-            outputs=[path for path, _ in clipPaths],
-            error=None if clipPaths else "ffmpeg produced no clip files",
-            meta={"clips": len(clipPaths)},
-        )
+        clipPaths: list[tuple[str, dict]] = []
+        clipsReused = False
+        clipDecisions = [
+            self._checkCache(
+                "8_clipping",
+                clipOutputPath(clip, highlightsDir),
+                clipInputs,
+                params=_clipParams(clip),
+                validator=(
+                    lambda path=clipOutputPath(clip, highlightsDir): (
+                        os.path.exists(path) and os.path.getsize(path) > 0,
+                        "clip is missing or empty",
+                    )
+                ),
+            )
+            for clip in expectedClips
+        ]
+        if all(decision.hit for decision in clipDecisions):
+            clipsReused = True
+            clipPaths = [
+                (clipOutputPath(clip, highlightsDir), clip) for clip in expectedClips
+            ]
+            log.info(f"Step 8: {len(clipPaths)} clips are cache hits")
+            status.setStep(
+                "8_clipping",
+                StepStatus.SKIPPED,
+                outputs=[path for path, _ in clipPaths],
+                meta={
+                    **self._cacheInfo(clipDecisions[0]),
+                    "clips": len(clipPaths),
+                },
+            )
+        else:
+            firstMiss = next(
+                (decision for decision in clipDecisions if not decision.hit), None
+            )
+            firstMissReason = firstMiss.reason if firstMiss else "clip rebuild"
+            log.info(f"Step 8: {firstMissReason} — cutting {len(expectedClips)} clips")
+            for clip in expectedClips:
+                self._cache.invalidate(clipOutputPath(clip, highlightsDir))
+            startedAt = time.monotonic()
+            try:
+                # Offload blocking ffmpeg calls to thread pool
+                clipPaths = await asyncio.to_thread(
+                    clipVideo, videoPath, timeTablePath, highlightsDir,
+                    dryRun=False, resolution=self.resolution,
+                )
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                log.exception("Video clipping failed")
+                status.finishStep("8_clipping", StepStatus.FAILED, error=err)
+                return
+
+            elapsedMs = int((time.monotonic() - startedAt) * 1000)
+            for clipPath, clip in clipPaths:
+                self._cache.record(
+                    clipPath,
+                    "8_clipping",
+                    clipInputs,
+                    params=_clipParams(clip),
+                    elapsedMs=elapsedMs,
+                    extra={"clips": len(clipPaths)},
+                )
+            status.finishStep(
+                "8_clipping",
+                StepStatus.OK if clipPaths else StepStatus.EMPTY,
+                outputs=[path for path, _ in clipPaths],
+                error=None if clipPaths else "ffmpeg produced no clip files",
+                meta={
+                    "clips": len(clipPaths),
+                    "reused": False,
+                    "cacheReason": firstMissReason,
+                    "elapsedMs": elapsedMs,
+                },
+            )
 
         # ── Step 9: segment-level SRT + thumbnails ─────────────
         log.info("Step 9: Generating subtitles and thumbnails...")
@@ -702,40 +1202,65 @@ class Controller:
         srtPath = asrPath.rsplit(".", 1)[0] + ".srt"
         srtFailures = 0
         thumbFailures = 0
+        reusedArtifacts = 0
         generated: list[str] = []
         for clipPath, clip in clipPaths:
             # Generate clip-specific SRT — best effort, the clip itself is
             # already produced and usable without subtitles.
             clipSrtPath = clipPath.rsplit(".", 1)[0] + ".srt"
-            try:
-                await asyncio.to_thread(
-                    generateClipSrt, srtPath, clip["start"], clip["end"], clipSrtPath,
-                )
+            if clipsReused and os.path.exists(clipSrtPath):
                 generated.append(clipSrtPath)
-            except Exception:
-                srtFailures += 1
-                log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)
+                reusedArtifacts += 1
+            else:
+                try:
+                    os.remove(clipSrtPath)
+                except OSError:
+                    pass
+                try:
+                    await asyncio.to_thread(
+                        generateClipSrt, srtPath, clip["start"], clip["end"], clipSrtPath,
+                    )
+                    generated.append(clipSrtPath)
+                except Exception:
+                    srtFailures += 1
+                    log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)
             # Thumbnail — same: best effort, offloaded to thread
             thumbPath = clipPath.rsplit(".", 1)[0] + ".jpg"
-            try:
-                await asyncio.to_thread(
-                    extractThumbnail, videoPath, clip["thumbnailTime"], thumbPath,
-                )
+            if clipsReused and os.path.exists(thumbPath):
                 generated.append(thumbPath)
-            except Exception:
-                thumbFailures += 1
-                log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
+                reusedArtifacts += 1
+            else:
+                try:
+                    os.remove(thumbPath)
+                except OSError:
+                    pass
+                try:
+                    await asyncio.to_thread(
+                        extractThumbnail, videoPath, clip["thumbnailTime"], thumbPath,
+                    )
+                    generated.append(thumbPath)
+                except Exception:
+                    thumbFailures += 1
+                    log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
         if srtFailures:
             log.warning(f"{srtFailures}/{len(clipPaths)} clips have no SRT")
         if thumbFailures:
             log.warning(f"{thumbFailures}/{len(clipPaths)} clips have no thumbnail")
+        allReused = clipsReused and reusedArtifacts == len(clipPaths) * 2
         status.finishStep(
             "9_subtitles_thumbnails",
-            StepStatus.OK if not (srtFailures and thumbFailures) else StepStatus.EMPTY,
+            (
+                StepStatus.SKIPPED
+                if allReused
+                else StepStatus.OK
+                if not (srtFailures and thumbFailures)
+                else StepStatus.EMPTY
+            ),
             outputs=generated,
             meta={
                 "srtFailures": srtFailures,
                 "thumbnailFailures": thumbFailures,
+                "reusedArtifacts": reusedArtifacts,
             },
         )
 
@@ -985,6 +1510,21 @@ async def main():
                         help="Output resolution")
     parser.add_argument("--dry-run", action="store_true", help="Only output time table, skip clipping")
     parser.add_argument("--output-dir", help="Override output directory")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild every derived artifact, ignoring cached metadata",
+    )
+    parser.add_argument(
+        "--from-step",
+        choices=STEP_ORDER,
+        help="Reuse earlier stages, rebuild this stage and every later one",
+    )
+    parser.add_argument(
+        "--only-step",
+        choices=STEP_ORDER,
+        help="Stop after this stage (prerequisites are reused when valid)",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
                         help="Log level (default: INFO)")
@@ -998,7 +1538,10 @@ async def main():
     ctrl = Controller(
         webRid=args.room_id,
         clip=args.clip,
-        clipOnly=args.clip_only,
+        clipOnly=(
+            args.clip_only
+            or (bool(args.from_step or args.only_step) and not args.clip)
+        ),
         profile=args.profile,
         sensitivity=args.sensitivity,
         minDuration=args.min_duration,
@@ -1007,6 +1550,9 @@ async def main():
         resolution=args.resolution,
         dryRun=args.dry_run,
         outputDir=args.output_dir,
+        force=args.force,
+        fromStep=args.from_step,
+        onlyStep=args.only_step,
     )
     await ctrl.start()
 

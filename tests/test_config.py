@@ -108,6 +108,10 @@ class TestPipelineSettingsDefaults:
         assert s.sensitivity_default == 2.5
         assert s.signal_pool_workers == 3
         assert s.ffmpeg_timeout_clip == 300
+        assert s.asr_model == "base"
+        assert s.asr_device == "auto"
+        assert s.asr_compute_type == "int8"
+        assert s.asr_diarize is True
 
 
 class TestEnvironmentOverrides:
@@ -127,6 +131,17 @@ class TestEnvironmentOverrides:
         monkeypatch.setenv("PIPELINE_MIN_DURATION_DEFAULT", "8.5")
         settings = PipelineSettings()
         assert settings.min_duration_default == 8.5
+
+    def test_pipeline_asr_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_ASR_MODEL", "tiny")
+        monkeypatch.setenv("PIPELINE_ASR_DEVICE", "cpu")
+        monkeypatch.setenv("PIPELINE_ASR_COMPUTE_TYPE", "float32")
+        monkeypatch.setenv("PIPELINE_ASR_DIARIZE", "false")
+        settings = PipelineSettings()
+        assert settings.asr_model == "tiny"
+        assert settings.asr_device == "cpu"
+        assert settings.asr_compute_type == "float32"
+        assert settings.asr_diarize is False
 
     def test_explicit_init_still_wins(self, monkeypatch):
         monkeypatch.setenv("AUDIO_PANNS_RMS_THRESHOLD", "9.9")
@@ -180,6 +195,12 @@ class TestStructuralValidation:
     def test_pipeline_duration_bounds(self):
         with pytest.raises(ValidationError, match="min_duration_default"):
             PipelineSettings(min_duration_default=90.0, max_duration_default=15.0)
+
+    def test_pipeline_asr_choices_validated(self):
+        with pytest.raises(ValidationError, match="asr_model"):
+            PipelineSettings(asr_model="huge")
+        with pytest.raises(ValidationError, match="asr_device"):
+            PipelineSettings(asr_device="tpu")
 
     def test_text_cluster_bounds(self):
         with pytest.raises(ValidationError, match="topic_kmeans_clusters_min"):

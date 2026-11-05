@@ -10,6 +10,19 @@ from src.util import fmtSize, fmtSrtTime
 log = getLogger(__name__)
 
 
+def clipOutputPath(clip: dict, outputDir: str) -> str:
+    """Return the deterministic output path for one time-table clip.
+
+    Kept separate from :func:`clipVideo` so resume/cache logic can predict
+    filenames without duplicating the sanitisation rules.
+    """
+    start = clip.get("start", 0)
+    trigger = clip.get("trigger", str(int(start)))
+    safeName = "".join(c for c in trigger if c.isalnum() or c in " _-+")[:30]
+    name = f"clip_{int(start)}s_{safeName}"
+    return os.path.join(outputDir, f"{name}.mp4")
+
+
 def clipVideo(
     inputPath: str,
     timeTablePath: str,
@@ -51,10 +64,8 @@ def clipVideo(
             log.warning(f"Skipping clip < 1s: {start}-{end}")
             continue
 
-        trigger = clip.get("trigger", str(int(start)))
-        safeName = "".join(c for c in trigger if c.isalnum() or c in " _-+")[:30]
-        name = f"clip_{int(start)}s_{safeName}"
-        outPath = os.path.join(outputDir, f"{name}.mp4")
+        outPath = clipOutputPath(clip, outputDir)
+        name = os.path.basename(outPath)[:-4]
 
         if needsScale:
             cmd = [

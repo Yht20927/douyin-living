@@ -1,8 +1,37 @@
 # -*- coding: utf-8 -*-
-"""Tests for logger module — getLogger, setLogLevel thread safety."""
+"""Tests for logger module — sinks, event JSONL and level changes."""
 
+import json
 import threading
+from pathlib import Path
+
+import pytest
+
+from src.log.events import EVENT_SCHEMA_VERSION, logEvent
 from src.log.logger import getLogger, setLogLevel, LoggerManager
+
+
+@pytest.fixture
+def isolatedLogs(tmp_path):
+    """Point both sinks at temp files and restore defaults afterwards."""
+    appLog = tmp_path / "app.log"
+    eventLog = tmp_path / "events.jsonl"
+    LoggerManager.setup(
+        logFile=appLog,
+        level="INFO",
+        eventLogFile=eventLog,
+        force=True,
+    )
+    yield appLog, eventLog
+    LoggerManager.setup(level="INFO", force=True)
+
+
+def _readEvents(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 class TestGetLogger:
@@ -57,3 +86,76 @@ class TestLoggerManager:
     def test_initialized_flag(self):
         """LoggerManager should be initialized after import."""
         assert LoggerManager._initialized
+
+
+class TestEventLog:
+    def test_event_written_to_jsonl_only(self, isolatedLogs):
+        appLog, eventLog = isolatedLogs
+
+        logEvent(
+            "pipeline.step",
+            runId="run-1",
+            roomId="room-1",
+            step="2_asr",
+            status="ok",
+            elapsedMs=42,
+            cacheReason="cache hit",
+            outputPath=Path("data/room/out.json"),
+        )
+        getLogger("human").info("ordinary message")
+
+        events = _readEvents(eventLog)
+        assert len(events) == 1
+        record = events[0]
+        assert record["schemaVersion"] == EVENT_SCHEMA_VERSION
+        assert record["event"] == "pipeline.step"
+        assert record["runId"] == "run-1"
+        assert record["roomId"] == "room-1"
+        assert record["step"] == "2_asr"
+        assert record["status"] == "ok"
+        assert record["elapsedMs"] == 42
+        assert record["cacheReason"] == "cache hit"
+        assert record["outputPath"] == "data/room/out.json"
+        assert record["ts"]
+
+        human = appLog.read_text(encoding="utf-8")
+        assert "ordinary message" in human
+        # Event payloads must not leak into the human-readable sinks.
+        assert "pipeline.step" not in human
+
+    def test_event_sink_survives_set_log_level(self, isolatedLogs):
+        _, eventLog = isolatedLogs
+        logEvent("before.level", runId="run-1", roomId="room-1")
+        setLogLevel("DEBUG")
+        logEvent("after.level", runId="run-1", roomId="room-1")
+
+        events = _readEvents(eventLog)
+        assert [event["event"] for event in events] == ["before.level", "after.level"]
+
+    def test_invalid_level_keeps_existing_sinks(self, isolatedLogs):
+        _, eventLog = isolatedLogs
+        with pytest.raises(ValueError, match="unknown log level"):
+            setLogLevel("NOT-A-LEVEL")
+
+        logEvent("still.works", runId="run-1", roomId="room-1")
+        events = _readEvents(eventLog)
+        assert events[-1]["event"] == "still.works"
+
+    def test_empty_event_name_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            logEvent("")
+
+    def test_core_fields_cannot_be_overridden(self, isolatedLogs):
+        _, eventLog = isolatedLogs
+        logEvent(
+            "pipeline.finish",
+            runId="run-1",
+            roomId="room-1",
+            elapsedMs="12",
+            **{"ts": "fake", "schemaVersion": "9.9"},
+        )
+        record = _readEvents(eventLog)[-1]
+        assert record["event"] == "pipeline.finish"
+        assert record["schemaVersion"] == EVENT_SCHEMA_VERSION
+        assert record["ts"] != "fake"
+        assert record["elapsedMs"] == 12

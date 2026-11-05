@@ -27,8 +27,11 @@ class GeneralConfig:
     # ── Logging ─────────────────────────────────────────────────
     logFilePath: str = str(Path(__file__).parent.parent.parent / "logs")
     defaultLogLevel: str = "INFO"   # Override via --log-level CLI arg
-    rotation: str = "10 MB"
-    retention: str = "7 days"
+    logRotation: str = "10 MB"      # loguru rotation: size ("10 MB") or "00:00"
+    logRetention: str = "7 days"    # keep rotated *.log.zip files this long
+    eventLogFileName: str = "events.jsonl"
+    eventLogRotation: str = "00:00"     # daily at midnight
+    eventLogRetention: str = "30 days"  # keep pipeline events for a month
 
     # ── Output directories ──────────────────────────────────────
     dataDir: str = str(Path(__file__).parent.parent.parent / "data")

@@ -25,7 +25,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|---------|------|
-| Python | 3.9+ | |
+| Python | 3.11+ | |
 | Node.js | 18+ | 用于签名 JS 执行 |
 | ffmpeg | 6.0+ | 视频处理 |
 | CUDA | 12.x (可选) | GPU 加速 ASR |
@@ -39,6 +39,9 @@ cd douyin-living
 
 # Python 依赖
 pip install -r requirements.txt
+
+# AI 切片依赖（仅录制可跳过）
+pip install -r requirements-ai.txt
 
 # Node.js 依赖（签名）
 npm --prefix scripts install
@@ -78,6 +81,15 @@ python -m src.controller 300294032039 --clip-only \
   --sensitivity 2.0 \        # 灵敏度: 2.0-3.5 (越低切片越多)
   --min-duration 10 \        # 最小切片时长
   --max-duration 60          # 最大切片时长
+
+# 断点续跑：复用 audio/asr/signal，从 score 重新打分并重新裁剪
+python -m src.controller 300294032039 --from-step score
+
+# 只重试失败或需要刷新的 ASR（前置 audio 命中缓存）
+python -m src.controller 300294032039 --only-step asr
+
+# 忽略所有 *.meta.json 缓存，强制重建全部派生文件
+python -m src.controller 300294032039 --force
 ```
 
 ---
@@ -111,6 +123,8 @@ data/300294032039/
 ├── visual_features.json                   ← 视觉分析结果
 ├── time_table.json                        ← 切片时间表
 ├── scores.json                            ← 全时间轴得分
+├── pipeline_status.json                   ← 每步状态/耗时/缓存统计
+├── *.meta.json                            ← 产物缓存元数据（源 hash/配置 hash）
 └── highlights/
     ├── clip_342s_dmDensity+asrKeyword.mp4 ← 切片视频
     ├── clip_342s_dmDensity+asrKeyword.srt ← 切片字幕
@@ -180,6 +194,9 @@ Z-Score 标准化 → 加权融合 → 时间衰减 → 突变奖励
 | `--resolution` | 720p | 输出分辨率: 720p/1080p/4k |
 | `--dry-run` | off | 仅输出时间表不裁剪 |
 | `--output-dir` | data/{roomId} | 自定义输出目录 |
+| `--force` | off | 忽略缓存元数据，重建全部派生文件 |
+| `--from-step` | 全部 | 复用此前步骤，从 audio/asr/signal/score/clip 重新执行 |
+| `--only-step` | 关闭 | 只执行到指定步骤，用于单步重试 |
 
 ---
 
@@ -187,6 +204,7 @@ Z-Score 标准化 → 加权融合 → 时间衰减 → 突变奖励
 
 | 文档 | 说明 |
 |------|------|
+| `docs/runbook.md` | 运行手册：Cookie/无流/ffmpeg/模型/磁盘/ASR OOM 与日志排查 |
 | `docs/superpowers/specs/2026-06-03-ai-clip-design.md` | AI 切片系统完整设计文档 |
 | `config/keywords.json` | 关键词词典（高能/搞笑/争议/互动/情感） |
 

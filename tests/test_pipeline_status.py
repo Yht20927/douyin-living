@@ -65,6 +65,33 @@ class TestPipelineStatus:
         assert saved["steps"]["skipped"]["status"] == "skipped"
         assert saved["failureSummary"] == []
 
+    def test_on_step_callback_receives_completed_record(self, tmp_path):
+        seen = []
+        status = PipelineStatus(
+            "room-1",
+            outputDir=tmp_path,
+            onStep=lambda name, record: seen.append((name, record)),
+        )
+        status.startStep("signal")
+        status.finishStep("signal", StepStatus.OK, meta={"reused": False})
+
+        assert seen[0][0] == "signal"
+        assert seen[0][1]["status"] == "ok"
+        assert seen[0][1]["meta"] == {"reused": False}
+        assert seen[0][1]["elapsedMs"] is not None
+
+        status.setStep("scored", StepStatus.OK, elapsedMs=123)
+        assert seen[-1][0] == "scored"
+        assert seen[-1][1]["elapsedMs"] == 123
+
+    def test_on_step_callback_errors_do_not_break_pipeline(self, tmp_path):
+        def boom(name, record):
+            raise RuntimeError("event sink down")
+
+        status = PipelineStatus("room-1", outputDir=tmp_path, onStep=boom)
+        status.setStep("asr", StepStatus.OK)
+        assert status.steps["asr"]["status"] == "ok"
+
 
 class TestFeatureArtifactInspection:
     def test_ok(self, tmp_path):

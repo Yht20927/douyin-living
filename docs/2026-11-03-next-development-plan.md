@@ -516,6 +516,17 @@ python -c "from src.config import load_settings; s=load_settings(); print(s.scor
 - pipeline 支持从任意步骤恢复（audio/asr/signal/score/clip）；
 - 失败步骤可单独重试，不必从录制开始。
 
+> **执行记录（2026-11-05）**
+>
+> - 新增 `ArtifactMeta` 契约（`src/contracts.py`）与 `ArtifactCache`（`src/pipeline/artifacts.py`），每个中间产物在旁路写入 `*.meta.json`，记录 artifact/source 指纹、`settingsHash`、步骤参数 hash、生成时间、耗时、schema/generator 版本。
+> - 缓存命中需同时满足：产物未被修改、sidecar 可读、schema/generator 版本一致、配置 hash 一致、步骤参数一致、输入文件集合与指纹一致；任一项不匹配即重建。
+> - audio、ASR、三路 signal、score（`time_table.json`）、每个 clip（`highlights/*.mp4`）均接入缓存；ASR 失败产物会被 validator 拒绝并在下次运行自动重试，不再需要手工删除 JSON。
+> - 新增 `--force`（全量重建）、`--from-step {audio,asr,signal,score,clip}`（复用前序、重建该步及之后）、`--only-step`（运行到指定步骤后停止）；`--from-step`/`--only-step` 单独使用时自动进入 clip-only 模式。
+> - `pipeline_status.json` 增加 `cacheStats` 与每步 `meta.reused / cacheReason / metaPath / elapsedMs`；`--only-step` 未执行的步骤不会出现在状态文件中。
+> - clip 文件复用依赖 `src/clipper.py` 新增的 `clipOutputPath()`，避免缓存层重复实现文件名规则；复用 clip 时 SRT/缩略图只补缺失文件。
+> - 新增 `tests/test_artifact_cache.py`、`tests/test_controller_pipeline_cache.py`，覆盖命中复用、源/配置/参数/版本变化重建、`--force`、`--from-step`、`--only-step`、ASR 失败重试、meta 缺失/损坏回退。
+> - 干净 Python 3.11 环境实测：`411 passed`，ruff 全绿，覆盖率 **84.5%**。
+
 ### S4-5 可观测性与运行手册
 
 - 结构化日志字段：`runId`、`roomId`、`step`、`elapsedMs`、`status`；
@@ -523,12 +534,26 @@ python -c "from src.config import load_settings; s=load_settings(); print(s.scor
 - 新增 `docs/runbook.md`：Cookie 过期、无流、ffmpeg 缺失、模型下载失败、磁盘满、ASR OOM 的处理步骤；
 - `check_env.py` 增加 `--clip` 模式，检查 AI 依赖和模型文件。
 
+> **执行记录（2026-11-05）**
+>
+> - 新增 `src/log/events.py`：`logEvent()` 输出单行 JSONL，固定字段 `ts/schemaVersion/event/runId/roomId/step/status/elapsedMs`，可附加 `reused/cacheReason/error/cacheHits` 等扩展字段；Path/Enum 等值会安全序列化。
+> - `LoggerManager` 拆出统一的 `_registerSinks()`，`setup()` 与 `setLogLevel()` 共用；新增 `logs/events.jsonl` sink，用 `extra["event"]` 过滤，普通 console/file sink 用反向过滤，事件不会污染人类可读日志；切换日志级别后事件 sink 仍然存在。
+> - `PipelineStatus` 新增可选 `onStep` 回调，每次步骤结束统一发 `pipeline.step`；controller 额外发 `pipeline.start` / `pipeline.finish`（含整体耗时、失败数、缓存命中统计）。回调异常被吞掉，观测逻辑不会中断管线。
+> - 日志轮转/保留配置提升到 `GeneralConfig`：普通日志默认 10 MB / 7 天，事件日志默认每天 00:00 / 30 天，轮转文件自动 zip；支持在 `GeneralConfig` 改成按大小或按天。
+> - ASR 运行参数外部化到 `config/pipeline.yaml`：`asr_model/asr_device/asr_compute_type/asr_diarize`，支持 `PIPELINE_ASR_*` 环境变量覆盖，作为 OOM 降档和强制 CPU 的正式路径；参数变化会改变缓存 key 并自动重建 ASR。
+> - 新增 `docs/runbook.md`：快速定位、状态语义、事件查询、Cookie/无流/ffmpeg/模型/磁盘/ASR OOM、缓存恢复、日志轮转、交付前检查。
+> - `check_env.py --clip` 在 Sprint 3 已实现，本阶段在运行手册中补充为交付前必跑项。
+> - 新增/扩展测试：事件 JSONL 字段与 sink 隔离、切级别后事件 sink 保留、非法级别不破坏现有 sink、`onStep` 回调与异常隔离、controller 端到端 `pipeline.start/step/finish` 事件与缓存复用字段。
+> - 干净 Python 3.11 环境实测：`421 passed`，ruff 全绿，覆盖率 **84.5%**。
+
 **Sprint 4 完成定义**
 
 - 模拟 403/404、空响应、10 秒断网、页面结构变化，均有可恢复路径；
 - 连续重连 3 次后没有 heartbeat 线程泄漏；
 - 损坏 FLV 段不会污染最终视频；
 - 重跑只重建必要步骤。
+
+> **Sprint 4 收尾（2026-11-05）**：S4-1 ~ S4-5 全部完成。录制韧性、产物缓存、结构化事件和运行手册均已落地；全量 `421 passed`，覆盖率 **84.5%**，ruff 全绿。
 
 ---
 

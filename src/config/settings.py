@@ -363,6 +363,21 @@ class PipelineSettings(_YamlSectionSettings):
     ffmpeg_timeout_thumbnail: int = Field(default=60, gt=0)
     ffmpeg_timeout_burn: int = Field(default=300, gt=0)
 
+    # ASR knobs are also the supported OOM escape hatch: lower the model,
+    # force CPU, or disable diarization without editing controller code.
+    asr_model: str = Field(
+        default="base", pattern=r"^(tiny|base|small|medium|large-v3)$"
+    )
+    asr_device: str = Field(default="auto", pattern=r"^(auto|cuda|cpu)$")
+    asr_compute_type: str = Field(
+        default="int8",
+        pattern=(
+            r"^(default|auto|int8|int8_float32|int8_float16|int8_bfloat16"
+            r"|int16|float16|bfloat16|float32)$"
+        ),
+    )
+    asr_diarize: bool = True
+
     @model_validator(mode="after")
     def _validateDurations(self):
         if self.min_duration_default >= self.max_duration_default:
