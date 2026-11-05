@@ -786,6 +786,19 @@ src/pipeline/
 - 信号贡献 Top-N；
 - 一键复制 ffmpeg 命令/时间码。
 
+> **S6-1 执行记录（2026-11-05）**：
+>
+> - 新增 `src/report.py`：读取 `time_table.json`、`scores.json`、`recall_candidates.json`、弹幕 JSONL 与 ASR JSON，生成单文件自包含 HTML（内联 CSS/JS、SVG 分数曲线、base64 缩略图，无外部 CDN）。
+> - 报告包含：分数曲线与候选时间带；候选卡片的起止/时长/分数/confidence/触发原因/风险/丢弃原因；信号贡献条形图；弹幕 Top 词与最近弹幕；ASR 状态/片段/语音时长/文本摘要；两阶段召回候选与来源；丢弃/边界调整记录。
+> - 每个候选提供“复制 ffmpeg 命令”和“复制时间码”按钮；复制失败时回退到手动复制提示。
+> - 输出路径为 `.html`/`.htm` 时按文件写入，缩略帧放同目录 `<stem>_media/`；其他路径按目录写入 `index.html` + `media/`。
+> - 缩略帧优先从源视频用 ffmpeg 提取（640 宽），失败时回退 `highlights/clip_<start>s_*.jpg`；没有源视频/ffmpeg 时显示“无缩略帧”。
+> - 弹幕分词优先使用可选依赖 jieba，缺失时回退中文 2~3-gram + ASCII 词，并过滤停用词/单字；Top 词、ASR、标题、路径均做 HTML 转义。
+> - `Controller` 新增 `reportHtml` 与 CLI `--report-html`，在 step 7 评分完成（含缓存命中）后生成；`--dry-run`、`--only-step score` 与“无候选片段”路径都会生成；报告失败只记录 warning，不中断主流程。
+> - 新增 `tests/test_report.py` 与 controller 集成测试，覆盖 HTML 转义、SVG/候选/召回/ASR/Top 词、缩略帧回退、缺失产物、目录/文件输出、CLI 透传、dry-run 生成与失败不中断。
+> - 全量 **646 passed**，覆盖率 **87%**（`src/report.py` 86%），`ruff check src tests scripts` 与 `git diff --check` 全绿。
+> - 报告分数仍未经人工标注校准，不能作为质量结论；真实 P@K / R@K 基线仍受标注集缺失阻塞。
+
 ### S6-2 片段元数据与资产
 
 每个片段输出 `clip_xxx.json`：

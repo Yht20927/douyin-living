@@ -636,6 +636,37 @@ P/R/F1、最佳 profile，以及 profile 两两之间的 total-variation / cosin
 > 当前仓库没有真实人工标注，所有 profile 仍只是先验权重。`profile_report.py`
 > 的结论必须以真实标注为准，不能仅凭权重距离宣称 profile 有效。
 
+### 10.5 Dry-run 可视化报告（S6-1）
+
+用已有录制做一次不裁剪的评分，并生成可直接在浏览器打开的 HTML：
+
+```bash
+DATA=data/300294032039
+python -m src.controller "$(basename "$DATA")" --clip-only --dry-run \
+  --report-html "$DATA/report/index.html"
+```
+
+- 报告在评分完成后生成，`--dry-run` 也会触发；生成失败只记录 warning，
+  不会中断评分/裁剪主流程；
+- 传入 `.html`/`.htm` 文件路径时，缩略帧写到同目录的 `<stem>_media/`；
+  传入目录时写 `<dir>/index.html` 和 `<dir>/media/`；
+- 页面自包含（内联 CSS/JS/SVG、base64 缩略图），不需要 CDN；
+- 缩略帧优先用源视频通过 ffmpeg 提取，失败时回退
+  `highlights/clip_<start>s_*.jpg`；
+- 报告包含分数曲线、候选原因/风险/丢弃原因、弹幕 Top 词、ASR 摘要、
+  信号贡献和可复制的 ffmpeg 命令/时间码；
+- 没有 `scores.json` / ASR / 弹幕 / 两阶段候选时，对应区块显示缺失提示，
+  不影响其他区块。
+
+排障：
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 报告没有生成，日志有 `Dry-run report generation failed` | 路径不可写、`time_table.json` 非法或模板异常 | 检查目录权限和 `time_table.json`；报告失败不影响主流程 |
+| 缩略帧显示“无缩略帧” | 源视频缺失、ffmpeg 失败且没有同名 `highlights/*.jpg` | 检查 ffmpeg 和 `--output-dir`；或用 `highlights` 里的封面回退 |
+| 弹幕 Top 词很少 | 该场次聊天文本少，或 jieba 未安装回退到 n-gram | 属于预期降级；可安装 `jieba` 后重生成报告 |
+| 报告里看不到召回区块 | 使用 legacy 评分或缺少 `recall_candidates.json` | 加 `--two-stage` 重跑评分 |
+
 ---
 
 ## 11. 发布前 / 交付前检查
@@ -649,9 +680,11 @@ pytest -q --cov=src --cov-fail-under=75
 ruff check src tests scripts
 
 # 3. 用已有录制做一次不裁剪的端到端验证
-python -m src.controller "$ROOM" --clip-only --dry-run
+python -m src.controller "$ROOM" --clip-only --dry-run \
+  --report-html "$DATA/report/index.html"
 
-# 4. 核对状态与事件
+# 4. 核对报告与状态/事件
+test -s "$DATA/report/index.html"
 jq '.failureSummary, .cacheStats' "$DATA/pipeline_status.json"
 jq -r 'select(.event == "pipeline.finish") | [.ts, .status, .failures] | @tsv' logs/events.jsonl | tail -1
 

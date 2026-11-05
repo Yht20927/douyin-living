@@ -116,6 +116,7 @@ class Controller:
         fromStep: str | None = None,
         onlyStep: str | None = None,
         twoStage: bool | None = None,
+        reportHtml: str | None = None,
     ):
         self.webRid = webRid
         self.clip = clip
@@ -133,6 +134,7 @@ class Controller:
         self.onlyStep = normalizeStepName(onlyStep)
         # None = follow config; explicit bool is used by CLI/tests.
         self.twoStage = _cfg.two_stage_enabled if twoStage is None else twoStage
+        self.reportHtml = reportHtml
         if self.onlyStep and not self.fromStep:
             self.fromStep = self.onlyStep
         self._artifactCache: ArtifactCache | None = None
@@ -216,6 +218,43 @@ class Controller:
         except (OSError, json.JSONDecodeError):
             return None
         return data if isinstance(data, dict) else None
+
+    async def _writeDryRunReport(
+        self,
+        timeTablePath: str,
+        scoresPath: str,
+        candidatesPath: str,
+        asrPath: str,
+        danmakuPath: str,
+        videoPath: str | None,
+    ) -> None:
+        """Render ``--report-html`` output; failures never abort clipping."""
+        if not self.reportHtml:
+            return
+        try:
+            from src.report import buildReport
+
+            summary = await asyncio.to_thread(
+                buildReport,
+                timeTablePath,
+                scoresPath=scoresPath,
+                candidatesPath=(
+                    candidatesPath if os.path.exists(candidatesPath) else None
+                ),
+                asrPath=asrPath if os.path.exists(asrPath) else None,
+                danmakuPath=(
+                    danmakuPath if os.path.exists(danmakuPath) else None
+                ),
+                videoPath=videoPath,
+                outputPath=self.reportHtml,
+            )
+            log.info(
+                f"Dry-run report: {summary['html']} "
+                f"({summary['candidates']} candidates, "
+                f"{summary['thumbnails']} thumbnails)"
+            )
+        except Exception:
+            log.exception("Dry-run report generation failed (continuing)")
 
     # ── start / stop ───────────────────────────────────────────
 
@@ -1173,6 +1212,15 @@ class Controller:
                 },
             )
 
+        await self._writeDryRunReport(
+            timeTablePath=timeTablePath,
+            scoresPath=scoresPath,
+            candidatesPath=candidatesPath,
+            asrPath=asrPath,
+            danmakuPath=danmakuPath,
+            videoPath=videoPath,
+        )
+
         if not clips:
             log.warning("No clips detected — see time_table.json dropped reasons")
             status.setStep(
@@ -1619,6 +1667,14 @@ async def main():
     parser.add_argument("--resolution", default=None, choices=["720p", "1080p", "4k"],
                         help="Output resolution")
     parser.add_argument("--dry-run", action="store_true", help="Only output time table, skip clipping")
+    parser.add_argument(
+        "--report-html",
+        metavar="PATH",
+        help=(
+            "Write a self-contained dry-run HTML report to PATH "
+            "(a .html file or a directory; works with --dry-run)"
+        ),
+    )
     parser.add_argument("--output-dir", help="Override output directory")
     parser.add_argument(
         "--force",
@@ -1679,6 +1735,7 @@ async def main():
         twoStage=(
             True if args.twoStage else (False if args.legacyScoring else None)
         ),
+        reportHtml=args.report_html,
     )
     await ctrl.start()
 

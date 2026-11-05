@@ -15,6 +15,7 @@
 | 🎵 **音频提取** | `-acodec copy` 无损提取 AAC，保留原始 PTS 时间戳 |
 | 🗣 **语音识别** | faster-whisper + WhisperX 说话人分离，输出 SRT 字幕 |
 | 🧠 **AI 切片** | 3 层 AI + 7 项数学方法融合打分，自动定位高光时刻；可选两阶段召回/精排 |
+| 🧾 **审核报告** | `--report-html` 输出自包含 dry-run 报告：分数曲线、候选卡片、缩略帧、弹幕 Top 词、ASR 摘要、可复制 ffmpeg 命令 |
 | ✂️ **智能裁剪** | ffmpeg 无损剪辑 + 字幕烧录 + 封面缩略图 |
 
 ---
@@ -96,6 +97,10 @@ python -m src.controller 300294032039 --clip-only --two-stage
 
 # 即使 config/pipeline.yaml 开启了 two_stage_enabled，也强制走旧评分
 python -m src.controller 300294032039 --clip-only --legacy-scoring
+
+# Sprint 6 dry-run 可视化报告（不裁剪，输出自包含 HTML）
+python -m src.controller 300294032039 --clip-only --dry-run \
+  --report-html data/300294032039/report/index.html
 ```
 
 ---
@@ -136,6 +141,9 @@ data/300294032039/
 ├── annotations.json                       ← 人工标注（S5-6，手动维护）
 ├── eval.json                              ← 评估报告（S5-6，可选）
 ├── label_report/                          ← 候选审核页 + 标注模板（S5-6）
+├── report/                                ← dry-run 可视化报告（S6-1，可选）
+│   ├── index.html                         ← 自包含页面（内联 CSS/JS/SVG/缩略图）
+│   └── media/                             ← 从源视频提取的缩略帧
 ├── *.meta.json                            ← 产物缓存元数据（源 hash/配置 hash）
 └── highlights/
     ├── clip_342s_dmDensity+asrKeyword.mp4 ← 切片视频
@@ -347,6 +355,30 @@ python scripts/profile_report.py \
 脚本只输出建议，不修改 `config/scorer.yaml`。当前仓库没有真实标注集，所有
 profile 仍只是先验权重，不能宣称已被数据验证。
 
+### Dry-run 可视化报告（Sprint 6 / S6-1）
+
+`--report-html <path>` 在评分完成后生成只读报告，`--dry-run` 同样有效；
+输出路径是 `.html`/`.htm` 文件时按文件写入，否则按目录写入 `index.html`：
+
+```bash
+python -m src.controller 300294032039 --clip-only --dry-run \
+  --report-html data/300294032039/report/index.html
+```
+
+报告内容：
+
+- 内联 SVG 分数曲线与候选时间带（无外部 CDN）；
+- 候选卡片：起止时间、时长、分数、confidence、触发原因/风险/丢弃原因；
+- 从源视频提取（失败时回退 `highlights/*.jpg`）的缩略帧，base64 内嵌；
+- 弹幕 Top 词（可选 jieba，缺失时回退中文 n-gram）、最近弹幕；
+- ASR 状态、片段数、语音时长、文本摘要与全部片段；
+- 信号贡献 Top-N 与权重/meanZ/maxZ；
+- 两阶段 `recall_candidates.json` 的召回窗口与来源；
+- 一键复制 ffmpeg 命令与时间码。
+
+报告生成失败只记录 warning，不会中断评分/裁剪主流程。报告中的分数尚未
+经过人工标注校准，不能直接当作质量结论。
+
 ### 直播类型预设
 
 | Profile | 适用场景 | 核心权重 |
@@ -387,6 +419,7 @@ profile 仍只是先验权重，不能宣称已被数据验证。
 | `--preprocess` | off | 启用 auto-editor 预处理 |
 | `--resolution` | 720p | 输出分辨率: 720p/1080p/4k |
 | `--dry-run` | off | 仅输出时间表不裁剪 |
+| `--report-html` | off | 输出自包含 dry-run HTML 报告（文件或目录，配合 `--dry-run` 使用） |
 | `--output-dir` | data/{roomId} | 自定义输出目录 |
 | `--force` | off | 忽略缓存元数据，重建全部派生文件 |
 | `--from-step` | 全部 | 复用此前步骤，从 audio/asr/signal/score/clip 重新执行 |

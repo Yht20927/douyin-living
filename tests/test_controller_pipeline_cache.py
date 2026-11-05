@@ -589,3 +589,49 @@ class TestPipelineCache:
         assert secondSteps["2_asr"]["cacheReason"] == "cache hit"
         assert events[-1]["event"] == "pipeline.finish"
         assert events[-1]["cacheHits"] >= 1
+
+
+class TestDryRunReport:
+    def test_dry_run_writes_html_report(self, pipelineEnv, tmp_path, monkeypatch):
+        # The fixture video is fake bytes; skip real ffmpeg extraction.
+        monkeypatch.setattr(
+            "src.report._extractThumbnail", lambda *args, **kwargs: False
+        )
+        reportPath = tmp_path / "report" / "index.html"
+
+        runPipeline(
+            pipelineEnv["outputDir"],
+            dryRun=True,
+            reportHtml=str(reportPath),
+        )
+
+        assert reportPath.exists()
+        text = reportPath.read_text(encoding="utf-8")
+        assert "切片 Dry-run 报告" in text
+        assert "moment" in text
+        assert "ffmpeg -hide_banner" in text
+        assert "复制时间码" in text
+        assert pipelineEnv["calls"]["clip"] == 0
+        status = loadStatus(pipelineEnv["outputDir"])
+        assert status["steps"]["8_clipping"]["meta"]["dryRun"] is True
+
+    def test_report_failure_does_not_abort_dry_run(
+        self, pipelineEnv, tmp_path, monkeypatch
+    ):
+        reportPath = tmp_path / "report" / "index.html"
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("report exploded")
+
+        monkeypatch.setattr("src.report.buildReport", explode)
+
+        runPipeline(
+            pipelineEnv["outputDir"],
+            dryRun=True,
+            reportHtml=str(reportPath),
+        )
+
+        assert not reportPath.exists()
+        status = loadStatus(pipelineEnv["outputDir"])
+        assert status["steps"]["7_scorer"]["status"] == "ok"
+        assert status["steps"]["8_clipping"]["meta"]["dryRun"] is True
