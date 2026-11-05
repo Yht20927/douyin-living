@@ -13,3 +13,13 @@ asr_model: "base"
 asr_device: "auto"
 asr_compute_type: "int8"
 asr_diarize: true
+
+# Two-stage recall/rerank (Sprint 5). Keep disabled until the annotated-set
+# evaluation confirms it beats the legacy point-scoring path.
+two_stage_enabled: false
+two_stage_recall_per_hour: 60.0
+two_stage_top_k: 20
+two_stage_min_gap_sec: 12.0
+two_stage_recall_threshold: 0.8
+two_stage_window_sec: 30.0
+two_stage_min_score: 0.0

@@ -593,6 +593,17 @@ src/pipeline/
 
 不要一次性重写 controller；先让新模块以函数形式接入，旧路径保留一个 sprint。
 
+> **S5-1 执行记录（2026-11-05）**：
+>
+> - 新增 `src/pipeline/window_features.py`：对 1 Hz 特征矩阵做 median/MAD 鲁棒标准化（裁剪 ±5），生成窗口级 `peakScore`、`meanScore`、`areaScore`、`prePostDelta`、`multiSignalAgreement`、`novelty`、`durationFit`，并保留每个信号的 peak/mean/area/前后对比/权重/贡献。
+> - 新增 `src/pipeline/stage1_recall.py`：时间轴对齐 → 归一化 → 按 profile 权重构建召回曲线（含 0.2×tanh 起势奖励）→ 复合峰 + `asrKeyword/speakerChange/eventLaughter/eventApplause/eventMusic/sceneChange` 专用锚点 → 邻近锚点合并来源 → 去重并受 `two_stage_recall_per_hour` 预算约束。1 小时、每分钟一个峰值的合成数据稳定输出 60 个候选（可配置 30~80）；候选写入 `recall_candidates.json`，含 `start/end/duration/score/peakTime/anchor/sources`。
+> - 新增 `src/pipeline/stage2_rerank.py`：对候选窗口做 ±8s 局部对齐和时长贴合，融合 peak/mean/前后对比/多信号一致性/novelty/durationFit，并对笑声/掌声/关键词/说话人切换/话题切换等语义事件加有上限的 bonus；输出 `confidence/reasons/risks/dropReasons/windowFeatures/breakdown`，保留旧 `time_table.json` 的 `clips/dropped/adjustments/alignment` 契约。支持 `topK`、重叠抑制、`top_k_cut/overlap/below_min_score/too_short` 丢弃原因。
+> - `twoStageScore()` 作为函数式入口，一次性产出 `time_table.json`、`scores.json`（含召回曲线、候选分、阶段耗时）和 `recall_candidates.json`；旧 `src.scorer.score()` 完全保留。
+> - 配置新增 `pipeline.two_stage_*`（默认 `two_stage_enabled=false`），支持 `PIPELINE_TWO_STAGE_*` 环境变量；CLI 新增 `--two-stage` / `--legacy-scoring`。两阶段参数进入 scorer 缓存 key，切换模式会自动重建时间表；旧缓存键保持不变。
+> - `pipeline_status.json` 的 `7_scorer` 增加 `pipeline` 与 `stages.recall/rerank/totalElapsedMs`，结构化事件 `pipeline.stage` / `pipeline.two_stage` 同时记录阶段耗时与候选/切片数量。
+> - 新增 `tests/test_window_features.py`、`tests/test_stage1_recall.py`、`tests/test_stage2_rerank.py`，并扩展配置与 controller 缓存测试（模式可切换、缓存命中、事件字段）。全量 **455 passed**，覆盖率 **85%**，`ruff check src tests` 与 `git diff --check` 全绿。
+> - 仍待 Sprint 5 后续完成：固定标注集指标、ASR 句界/静音/场景边界融合、文本特征升级、视觉单次解码。当前默认仍走旧评分路径，便于 A/B 对照。
+
 ### S5-2 窗口级评分与边界优化
 
 - 从“秒级点分数”升级为“窗口级分数”：

@@ -112,6 +112,13 @@ class TestPipelineSettingsDefaults:
         assert s.asr_device == "auto"
         assert s.asr_compute_type == "int8"
         assert s.asr_diarize is True
+        assert s.two_stage_enabled is False
+        assert s.two_stage_recall_per_hour == 60.0
+        assert s.two_stage_top_k == 20
+        assert s.two_stage_min_gap_sec == 12.0
+        assert s.two_stage_recall_threshold == 0.8
+        assert s.two_stage_window_sec == 30.0
+        assert s.two_stage_min_score == 0.0
 
 
 class TestEnvironmentOverrides:
@@ -142,6 +149,23 @@ class TestEnvironmentOverrides:
         assert settings.asr_device == "cpu"
         assert settings.asr_compute_type == "float32"
         assert settings.asr_diarize is False
+
+    def test_pipeline_two_stage_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_ENABLED", "true")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_RECALL_PER_HOUR", "45")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_TOP_K", "12")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_MIN_GAP_SEC", "8.5")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_RECALL_THRESHOLD", "1.1")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_WINDOW_SEC", "25")
+        monkeypatch.setenv("PIPELINE_TWO_STAGE_MIN_SCORE", "0.15")
+        settings = PipelineSettings()
+        assert settings.two_stage_enabled is True
+        assert settings.two_stage_recall_per_hour == 45.0
+        assert settings.two_stage_top_k == 12
+        assert settings.two_stage_min_gap_sec == 8.5
+        assert settings.two_stage_recall_threshold == 1.1
+        assert settings.two_stage_window_sec == 25.0
+        assert settings.two_stage_min_score == 0.15
 
     def test_explicit_init_still_wins(self, monkeypatch):
         monkeypatch.setenv("AUDIO_PANNS_RMS_THRESHOLD", "9.9")

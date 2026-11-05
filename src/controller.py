@@ -113,6 +113,7 @@ class Controller:
         force: bool = False,
         fromStep: str | None = None,
         onlyStep: str | None = None,
+        twoStage: bool | None = None,
     ):
         self.webRid = webRid
         self.clip = clip
@@ -128,6 +129,8 @@ class Controller:
         self.force = force
         self.fromStep = normalizeStepName(fromStep)
         self.onlyStep = normalizeStepName(onlyStep)
+        # None = follow config; explicit bool is used by CLI/tests.
+        self.twoStage = _cfg.two_stage_enabled if twoStage is None else twoStage
         if self.onlyStep and not self.fromStep:
             self.fromStep = self.onlyStep
         self._artifactCache: ArtifactCache | None = None
@@ -433,10 +436,11 @@ class Controller:
         log.info("=" * 50)
         log.info("Starting AI clipping pipeline")
         log.info(
-            "Options: force={} fromStep={} onlyStep={}",
+            "Options: force={} fromStep={} onlyStep={} scoring={}",
             self.force,
             self.fromStep,
             self.onlyStep,
+            "two_stage" if self.twoStage else "legacy",
         )
         log.info("=" * 50)
         os.makedirs(self.outputDir, exist_ok=True)
@@ -455,6 +459,10 @@ class Controller:
                 extra["cacheReason"] = meta["cacheReason"]
             if record.get("error"):
                 extra["error"] = record["error"]
+            if meta.get("pipeline"):
+                extra["scoring"] = meta["pipeline"]
+            if meta.get("stages"):
+                extra["stages"] = meta["stages"]
             logEvent(
                 "pipeline.step",
                 runId=status.runId,
@@ -480,6 +488,7 @@ class Controller:
             outputDir=self.outputDir,
             profile=self.profile,
             sensitivity=self.sensitivity,
+            scoring="two_stage" if self.twoStage else "legacy",
             force=self.force,
             fromStep=self.fromStep,
             onlyStep=self.onlyStep,
@@ -956,8 +965,10 @@ class Controller:
 
         # ── Step 7: Scoring ────────────────────────────────────
         log.info("Step 7: Scoring...")
+        useTwoStage = bool(self.twoStage)
         timeTablePath = os.path.join(self.outputDir, "time_table.json")
         scoresPath = os.path.join(self.outputDir, "scores.json")
+        candidatesPath = os.path.join(self.outputDir, "recall_candidates.json")
         scoringInputs = [
             path
             for path, stepName in (
@@ -974,6 +985,24 @@ class Controller:
             "maxDuration": self.maxDuration,
             "durationSec": round(float(durationSec), 3) if durationSec else None,
         }
+        if useTwoStage:
+            # Extra keys on purpose: switching scoring modes must invalidate
+            # the cached time table, while legacy cache entries stay valid.
+            scoreParams["scoring"] = "two_stage"
+            scoreParams["twoStage"] = {
+                "recallPerHour": _cfg.two_stage_recall_per_hour,
+                "topK": _cfg.two_stage_top_k,
+                "minGapSec": _cfg.two_stage_min_gap_sec,
+                "recallThreshold": _cfg.two_stage_recall_threshold,
+                "windowSeconds": _cfg.two_stage_window_sec,
+                "minScore": _cfg.two_stage_min_score,
+            }
+
+        def _scoreOutputs(pipeline: str = "") -> list[str]:
+            outputs = [timeTablePath, scoresPath]
+            if pipeline == "two_stage" and os.path.exists(candidatesPath):
+                outputs.append(candidatesPath)
+            return outputs
 
         def _timeTableValidator() -> tuple[bool, str]:
             if not os.path.exists(scoresPath):
@@ -993,14 +1022,18 @@ class Controller:
         if scoreDecision.hit:
             result = self._loadJsonDict(timeTablePath) or {"clips": []}
             clips = result.get("clips") or []
+            pipelineLabel = result.get("pipeline", "legacy")
+            stages = result.get("stages") or {}
             log.info(f"Step 7: scoring cache hit ({len(clips)} clips)")
             status.setStep(
                 "7_scorer",
                 StepStatus.SKIPPED if clips else StepStatus.EMPTY,
-                outputs=[timeTablePath, scoresPath],
+                outputs=_scoreOutputs(pipelineLabel),
                 error=None if clips else "no candidate clips survived detection",
                 meta={
                     **self._cacheInfo(scoreDecision),
+                    "pipeline": pipelineLabel,
+                    "stages": stages,
                     "clips": len(clips),
                     "dropped": len(result.get("dropped") or []),
                     "adjustments": len(result.get("adjustments") or []),
@@ -1010,23 +1043,48 @@ class Controller:
         else:
             log.info(f"Step 7: {scoreDecision.reason} — scoring")
             self._cache.invalidate(timeTablePath)
-            from src.scorer import score
             status.startStep("7_scorer", inputs=scoringInputs)
             startedAt = time.monotonic()
             try:
-                result = score(
-                    roomId=self.webRid,
-                    audioFeatures=audioFeat,
-                    textFeatures=textFeat,
-                    visualFeatures=visualFeat,
-                    profile=self.profile,
-                    sensitivity=self.sensitivity,
-                    minDuration=self.minDuration,
-                    maxDuration=self.maxDuration,
-                    durationSec=durationSec or None,
-                    outputPath=timeTablePath,
-                    scoresPath=scoresPath,
-                )
+                if useTwoStage:
+                    from src.pipeline.stage2_rerank import twoStageScore
+
+                    result = twoStageScore(
+                        roomId=self.webRid,
+                        audioFeatures=audioFeat,
+                        textFeatures=textFeat,
+                        visualFeatures=visualFeat,
+                        profile=self.profile,
+                        minDuration=self.minDuration,
+                        maxDuration=self.maxDuration,
+                        durationSec=durationSec or None,
+                        recallPerHour=_cfg.two_stage_recall_per_hour,
+                        topK=_cfg.two_stage_top_k,
+                        minGapSec=_cfg.two_stage_min_gap_sec,
+                        recallThreshold=_cfg.two_stage_recall_threshold,
+                        windowSeconds=_cfg.two_stage_window_sec,
+                        minScore=_cfg.two_stage_min_score,
+                        outputPath=timeTablePath,
+                        scoresPath=scoresPath,
+                        candidatesPath=candidatesPath,
+                        runId=status.runId,
+                    )
+                else:
+                    from src.scorer import score
+
+                    result = score(
+                        roomId=self.webRid,
+                        audioFeatures=audioFeat,
+                        textFeatures=textFeat,
+                        visualFeatures=visualFeat,
+                        profile=self.profile,
+                        sensitivity=self.sensitivity,
+                        minDuration=self.minDuration,
+                        maxDuration=self.maxDuration,
+                        durationSec=durationSec or None,
+                        outputPath=timeTablePath,
+                        scoresPath=scoresPath,
+                    )
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 log.exception("Scoring failed")
@@ -1035,6 +1093,8 @@ class Controller:
 
             elapsedMs = int((time.monotonic() - startedAt) * 1000)
             clips = result.get("clips") or []
+            pipelineLabel = result.get("pipeline", "legacy")
+            stages = result.get("stages") or {}
             self._cache.record(
                 timeTablePath,
                 "7_scorer",
@@ -1042,6 +1102,8 @@ class Controller:
                 params=scoreParams,
                 elapsedMs=elapsedMs,
                 extra={
+                    "pipeline": pipelineLabel,
+                    "stages": stages,
                     "clips": len(clips),
                     "dropped": len(result.get("dropped") or []),
                     "adjustments": len(result.get("adjustments") or []),
@@ -1050,9 +1112,11 @@ class Controller:
             status.finishStep(
                 "7_scorer",
                 StepStatus.OK if clips else StepStatus.EMPTY,
-                outputs=[timeTablePath, scoresPath],
+                outputs=_scoreOutputs(pipelineLabel),
                 error=None if clips else "no candidate clips survived detection",
                 meta={
+                    "pipeline": pipelineLabel,
+                    "stages": stages,
                     "clips": len(clips),
                     "dropped": len(result.get("dropped") or []),
                     "adjustments": len(result.get("adjustments") or []),
@@ -1525,6 +1589,19 @@ async def main():
         choices=STEP_ORDER,
         help="Stop after this stage (prerequisites are reused when valid)",
     )
+    scoringGroup = parser.add_mutually_exclusive_group()
+    scoringGroup.add_argument(
+        "--two-stage",
+        action="store_true",
+        dest="twoStage",
+        help="Use stage-1 recall + stage-2 reranking instead of the legacy scorer",
+    )
+    scoringGroup.add_argument(
+        "--legacy-scoring",
+        action="store_true",
+        dest="legacyScoring",
+        help="Force the legacy point-scoring path even when config enables two-stage",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
                         help="Log level (default: INFO)")
@@ -1553,6 +1630,9 @@ async def main():
         force=args.force,
         fromStep=args.from_step,
         onlyStep=args.only_step,
+        twoStage=(
+            True if args.twoStage else (False if args.legacyScoring else None)
+        ),
     )
     await ctrl.start()
 

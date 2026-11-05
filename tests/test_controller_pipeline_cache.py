@@ -41,6 +41,7 @@ def pipelineEnv(tmp_path, monkeypatch):
         "text_signal": 0,
         "visual_signal": 0,
         "score": 0,
+        "two_stage": 0,
         "clip": 0,
         "srt": 0,
         "thumbnail": 0,
@@ -145,6 +146,49 @@ def pipelineEnv(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr("src.scorer.score", fakeScore)
+
+    def fakeTwoStage(**kwargs):
+        calls["two_stage"] += 1
+        clips = [
+            {
+                "id": 1,
+                "start": 4.0,
+                "end": 24.0,
+                "duration": 20.0,
+                "score": 0.8,
+                "confidence": 0.7,
+                "trigger": "rms",
+                "title": "two-stage moment",
+                "tags": ["音量"],
+                "candidateSource": "two_stage",
+                "reasons": ["rms"],
+                "risks": [],
+                "dropReasons": [],
+                "thumbnailTime": 5.0,
+            }
+        ]
+        result = {
+            "pipeline": "two_stage",
+            "stages": {
+                "recall": {"candidateCount": 3, "elapsedMs": 4},
+                "rerank": {"inputCount": 3, "outputCount": 1, "elapsedMs": 2},
+                "totalElapsedMs": 6,
+            },
+            "clips": clips,
+            "dropped": [],
+            "adjustments": [],
+            "alignment": [],
+        }
+        Path(kwargs["outputPath"]).write_text(json.dumps(result), encoding="utf-8")
+        Path(kwargs["scoresPath"]).write_text(
+            json.dumps({"pipeline": "two_stage", "scores": []}), encoding="utf-8"
+        )
+        Path(kwargs["candidatesPath"]).write_text(
+            json.dumps({"candidates": [1, 2, 3]}), encoding="utf-8"
+        )
+        return result
+
+    monkeypatch.setattr("src.pipeline.stage2_rerank.twoStageScore", fakeTwoStage)
 
     from src.clipper import clipOutputPath
 
@@ -319,6 +363,51 @@ class TestPipelineCache:
         assert calls["score"] == before["score"]
         saved = loadStatus(outputDir)
         assert "7_scorer" not in saved["steps"]
+
+    def test_two_stage_scoring_is_selectable_and_cached(
+        self, pipelineEnv, monkeypatch
+    ):
+        outputDir = pipelineEnv["outputDir"]
+        calls = pipelineEnv["calls"]
+        events = []
+
+        def fakeLogEvent(event, **fields):
+            payload = {"event": event, **fields}
+            events.append(payload)
+            return payload
+
+        monkeypatch.setattr("src.controller.logEvent", fakeLogEvent)
+
+        # Seed the output directory with a legacy result first: switching
+        # modes must invalidate the cached time table because the scoring
+        # parameters changed.
+        runPipeline(outputDir)
+        assert calls["score"] == 1
+        assert calls["two_stage"] == 0
+
+        runPipeline(outputDir, twoStage=True)
+        assert calls["score"] == 1
+        assert calls["two_stage"] == 1
+        assert (outputDir / "recall_candidates.json").exists()
+
+        status = loadStatus(outputDir)
+        step = status["steps"]["7_scorer"]
+        assert step["meta"]["pipeline"] == "two_stage"
+        assert step["meta"]["stages"]["recall"]["candidateCount"] == 3
+        assert any(str(outputDir / "recall_candidates.json") == p for p in step["artifacts"])
+
+        scoreEvents = [
+            event for event in events
+            if event.get("event") == "pipeline.step" and event.get("step") == "7_scorer"
+        ]
+        assert scoreEvents[-1]["scoring"] == "two_stage"
+        assert scoreEvents[-1]["stages"]["rerank"]["outputCount"] == 1
+
+        # A second two-stage run reuses the time table; the legacy scorer must
+        # never be called.
+        runPipeline(outputDir, twoStage=True)
+        assert calls["two_stage"] == 1
+        assert loadStatus(outputDir)["steps"]["7_scorer"]["status"] == "skipped"
 
     def test_failed_asr_is_retried(self, pipelineEnv):
         outputDir = pipelineEnv["outputDir"]

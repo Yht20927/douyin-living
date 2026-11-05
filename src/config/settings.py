@@ -378,6 +378,16 @@ class PipelineSettings(_YamlSectionSettings):
     )
     asr_diarize: bool = True
 
+    # Two-stage recall/rerank (Sprint 5).  Disabled by default so the legacy
+    # scorer remains the production path until the new pipeline is validated.
+    two_stage_enabled: bool = False
+    two_stage_recall_per_hour: float = Field(default=60.0, gt=0.0)
+    two_stage_top_k: int = Field(default=20, ge=1)
+    two_stage_min_gap_sec: float = Field(default=12.0, gt=0.0)
+    two_stage_recall_threshold: float = Field(default=0.8, ge=0.0)
+    two_stage_window_sec: float = Field(default=30.0, gt=0.0)
+    two_stage_min_score: float = Field(default=0.0, ge=0.0)
+
     @model_validator(mode="after")
     def _validateDurations(self):
         if self.min_duration_default >= self.max_duration_default:

@@ -14,7 +14,7 @@
 | 💬 **弹幕采集** | WebSocket 实时接收聊天/礼物/点赞/进场/房间统计 |
 | 🎵 **音频提取** | `-acodec copy` 无损提取 AAC，保留原始 PTS 时间戳 |
 | 🗣 **语音识别** | faster-whisper + WhisperX 说话人分离，输出 SRT 字幕 |
-| 🧠 **AI 切片** | 3 层 AI + 7 项数学方法融合打分，自动定位高光时刻 |
+| 🧠 **AI 切片** | 3 层 AI + 7 项数学方法融合打分，自动定位高光时刻；可选两阶段召回/精排 |
 | ✂️ **智能裁剪** | ffmpeg 无损剪辑 + 字幕烧录 + 封面缩略图 |
 
 ---
@@ -90,6 +90,12 @@ python -m src.controller 300294032039 --only-step asr
 
 # 忽略所有 *.meta.json 缓存，强制重建全部派生文件
 python -m src.controller 300294032039 --force
+
+# Sprint 5 两阶段召回/精排（默认关闭，按需开启）
+python -m src.controller 300294032039 --clip-only --two-stage
+
+# 即使 config/pipeline.yaml 开启了 two_stage_enabled，也强制走旧评分
+python -m src.controller 300294032039 --clip-only --legacy-scoring
 ```
 
 ---
@@ -123,6 +129,7 @@ data/300294032039/
 ├── visual_features.json                   ← 视觉分析结果
 ├── time_table.json                        ← 切片时间表
 ├── scores.json                            ← 全时间轴得分
+├── recall_candidates.json                 ← 两阶段模式：阶段 A 候选窗口
 ├── pipeline_status.json                   ← 每步状态/耗时/缓存统计
 ├── *.meta.json                            ← 产物缓存元数据（源 hash/配置 hash）
 └── highlights/
@@ -152,6 +159,27 @@ Z-Score 标准化 → 加权融合 → 时间衰减 → 突变奖励
     ↓
 时间表 → ffmpeg 批量无损剪辑
 ```
+
+### 两阶段召回/精排（Sprint 5，可选）
+
+开启 `--two-stage` 或 `PIPELINE_TWO_STAGE_ENABLED=true` 后：
+
+```text
+阶段 A（低成本全量召回）
+  1 Hz 对齐 → median/MAD 鲁棒标准化 → profile 加权召回曲线
+  + ASR 关键词/笑声/掌声/说话人切换/场景切点锚点
+  → 每小时 30~80 个候选窗口（recall_candidates.json）
+
+阶段 B（窗口级精排）
+  peak / mean / area / 前后对比 / 多信号一致性 / novelty / durationFit
+  + 语义事件 bonus → topK + 重叠抑制
+  → confidence / reasons / risks / windowFeatures → time_table.json
+```
+
+默认 `two_stage_enabled=false`，旧评分路径保留，便于用固定标注集做 A/B。
+两阶段参数：`two_stage_recall_per_hour`、`two_stage_top_k`、`two_stage_min_gap_sec`、
+`two_stage_recall_threshold`、`two_stage_window_sec`、`two_stage_min_score`，
+均可在 `config/pipeline.yaml` 或 `PIPELINE_TWO_STAGE_*` 环境变量中配置。
 
 ### 直播类型预设
 
@@ -197,6 +225,8 @@ Z-Score 标准化 → 加权融合 → 时间衰减 → 突变奖励
 | `--force` | off | 忽略缓存元数据，重建全部派生文件 |
 | `--from-step` | 全部 | 复用此前步骤，从 audio/asr/signal/score/clip 重新执行 |
 | `--only-step` | 关闭 | 只执行到指定步骤，用于单步重试 |
+| `--two-stage` | off | 使用两阶段召回/精排评分（覆盖配置） |
+| `--legacy-scoring` | off | 强制旧评分路径（覆盖配置） |
 
 ---
 
