@@ -13,6 +13,17 @@ profiles:
     dmEntropy: 0.05
     dmSentiment: 0.10
     dmUtr: 0.03
+    dmUniqueUsers: 0.05
+    dmRepeatRate: 0.00
+    dmQuestionRate: 0.02
+    dmExclamationRate: 0.02
+    dmEmojiRate: 0.02
+    keywordHighEnergy: 0.04
+    keywordFunny: 0.05
+    keywordControversy: 0.02
+    keywordInteractive: 0.03
+    keywordEmotional: 0.03
+    keywordShopping: 0.02
     asrKeyword: 0.10
     topicChange: 0.05
     speakerChange: 0.05
@@ -31,6 +42,17 @@ profiles:
     dmEntropy: 0.05
     dmSentiment: 0.05
     dmUtr: 0.03
+    dmUniqueUsers: 0.04
+    dmRepeatRate: 0.00
+    dmQuestionRate: 0.02
+    dmExclamationRate: 0.03
+    dmEmojiRate: 0.01
+    keywordHighEnergy: 0.06
+    keywordFunny: 0.05
+    keywordControversy: 0.03
+    keywordInteractive: 0.03
+    keywordEmotional: 0.01
+    keywordShopping: 0.00
     asrKeyword: 0.07
     topicChange: 0.05
     speakerChange: 0.03
@@ -49,6 +71,17 @@ profiles:
     dmEntropy: 0.04
     dmSentiment: 0.06
     dmUtr: 0.04
+    dmUniqueUsers: 0.06
+    dmRepeatRate: 0.00
+    dmQuestionRate: 0.03
+    dmExclamationRate: 0.01
+    dmEmojiRate: 0.01
+    keywordHighEnergy: 0.02
+    keywordFunny: 0.02
+    keywordControversy: 0.02
+    keywordInteractive: 0.04
+    keywordEmotional: 0.01
+    keywordShopping: 0.10
     asrKeyword: 0.22
     topicChange: 0.06
     speakerChange: 0.06
@@ -67,6 +100,17 @@ profiles:
     dmEntropy: 0.03
     dmSentiment: 0.14
     dmUtr: 0.03
+    dmUniqueUsers: 0.05
+    dmRepeatRate: 0.00
+    dmQuestionRate: 0.02
+    dmExclamationRate: 0.02
+    dmEmojiRate: 0.02
+    keywordHighEnergy: 0.04
+    keywordFunny: 0.04
+    keywordControversy: 0.01
+    keywordInteractive: 0.03
+    keywordEmotional: 0.05
+    keywordShopping: 0.00
     asrKeyword: 0.10
     topicChange: 0.05
     speakerChange: 0.10

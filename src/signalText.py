@@ -3,6 +3,7 @@
 
 import json
 import hashlib
+import re
 import threading
 import numpy as np
 from pathlib import Path
@@ -26,6 +27,42 @@ _KEYWORD_CONFIG_PATH = Path(_cfg.keyword_config_path)
 POOL_NAME_FASTTEXT = "fasttext:cc.zh.300"
 POOL_NAME_TEXT2VEC = f"text2vec:{_cfg.text2vec_model.replace('/', '-')}"
 POOL_NAME_HF_SENTIMENT = f"hf:{_cfg.sentiment_model.replace('/', '-').replace('uer-', '')}"
+
+# Keyword categories from config/keywords.json → canonical feature names.
+KEYWORD_CATEGORY_FEATURES: dict[str, str] = {
+    "highEnergy": "keywordHighEnergy",
+    "funny": "keywordFunny",
+    "controversy": "keywordControversy",
+    "interactive": "keywordInteractive",
+    "emotional": "keywordEmotional",
+    "shopping": "keywordShopping",
+}
+
+_CATEGORY_ALIASES = {
+    "highenergy": "highEnergy",
+    "funny": "funny",
+    "controversy": "controversy",
+    "interactive": "interactive",
+    "emotional": "emotional",
+    "shopping": "shopping",
+}
+
+_QUESTION_MARKERS = ("?", "？")
+_EXCLAMATION_MARKERS = ("!", "！")
+_EMOJI_PATTERN = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]"
+    r"|\[[^\[\]]{1,8}\]"
+)
+
+_RULE_POSITIVE = {
+    "哈哈", "哈哈哈", "好", "nice", "牛", "牛批", "赞", "喜欢",
+    "漂亮", "精彩", "笑", "笑死", "乐", "666", "绝了", "感动",
+    "爱了", "厉害", "优秀", "谢谢", "开心", "可爱", "好笑",
+}
+_RULE_NEGATIVE = {
+    "无语", "差", "垃圾", "退", "骗", "恶心", "翻车", "下头",
+    "难受", "破防", "哭了", "失望", "生气", "离谱", "别买",
+}
 
 
 def extractFeatures(
@@ -67,11 +104,16 @@ def extractFeatures(
             "duration": 0,
             "status": "failed",
             "error": f"{type(exc).__name__}: {exc}",
-            "generatorVersion": "signalText/2",
+            "generatorVersion": "signalText/3",
             "featureCount": 0,
             "features": {
                 "dmDensity": [], "dmAcceleration": [], "dmEntropy": [],
                 "dmSentiment": [], "dmUniqueUsers": [], "dmUtr": [],
+                "dmRepeatRate": [], "dmQuestionRate": [],
+                "dmExclamationRate": [], "dmEmojiRate": [],
+                "keywordHighEnergy": [], "keywordFunny": [],
+                "keywordControversy": [], "keywordInteractive": [],
+                "keywordEmotional": [], "keywordShopping": [],
                 "asrKeyword": [], "topicChange": [], "speakerChange": [],
             },
         }
@@ -210,7 +252,7 @@ def _extractTextFeaturesImpl(
                     import jieba
                     _jieba_loaded = True
                 words = list(jieba.cut(content))
-                sentiment = _fastSentiment(words, _pool, _holdings)
+                sentiment = _sentimentForWords(words, _pool, _holdings)
                 dmSentimentSum[sec] += sentiment
                 dmSentimentCount[sec] += 1
             except Exception:
@@ -222,13 +264,34 @@ def _extractTextFeaturesImpl(
         uniqueUserCounts = [len(s) for s in dmUniqueUsers]
         del dmUniqueUsers  # free memory
 
-        # Anti-spam: UTR per 30s window
+        # Anti-spam: UTR per 30s window.  When enabled, calibrate the cut-off
+        # from seconds that actually contain danmaku instead of trusting a
+        # hard-coded threshold; sparse recordings keep the configured value.
         utrRaw = _computeUtr(allText30s)
+        utrSamples = [
+            utrRaw[t] for t in range(nSecs)
+            if allText30s[t] and utrRaw[t] > 0
+        ]
+        if _cfg.utr_auto_calibrate and utrThreshold == UTR_THRESHOLD:
+            effectiveUtr, utrSource = _calibrateUtrThreshold(
+                utrSamples,
+                configured=utrThreshold,
+                percentile=_cfg.utr_calibration_percentile,
+                minSamples=_cfg.utr_calibration_min_samples,
+                low=_cfg.utr_calibration_min,
+                high=_cfg.utr_calibration_max,
+            )
+        else:
+            effectiveUtr, utrSource = float(utrThreshold), "configured"
 
         # Apply anti-spam penalty
         dmAdjustedDensity = []
         for t in range(nSecs):
-            penalty = min(1.0, utrRaw[t] / utrThreshold) if utrRaw[t] > 0 else 1.0
+            penalty = (
+                min(1.0, utrRaw[t] / effectiveUtr)
+                if utrRaw[t] > 0 and effectiveUtr > 0
+                else 1.0
+            )
             dmAdjustedDensity.append(dmDensity[t] * penalty)
 
         # ── Process ASR ────────────────────────────────────────
@@ -316,6 +379,21 @@ def _extractTextFeaturesImpl(
         # Compute topic change (text2vec + KMeans across all windows)
         topicVec = _computeTopicChange(allText30s, nSecs, _pool, _holdings)
 
+        # Danmaku engagement rates and category-specific keyword intensities.
+        dmRepeatRate = _computeRepeatRate(allText30s)
+        dmQuestionRate = _computeMessageRate(
+            allText30s,
+            lambda text: any(marker in text for marker in _QUESTION_MARKERS),
+        )
+        dmExclamationRate = _computeMessageRate(
+            allText30s,
+            lambda text: any(marker in text for marker in _EXCLAMATION_MARKERS),
+        )
+        dmEmojiRate = _computeMessageRate(allText30s, _textHasEmoji)
+        keywordSignals = _computeKeywordCategorySignals(
+            allText30s, keywordDict, asrSegments
+        )
+
         featureDict = {
             "dmDensity": dmAdjustedDensity,
             "dmAcceleration": _secondDerivative(dmAdjustedDensity),
@@ -324,6 +402,11 @@ def _extractTextFeaturesImpl(
                             for i in range(nSecs)],
             "dmUniqueUsers": uniqueUserCounts,
             "dmUtr": utrRaw,
+            "dmRepeatRate": dmRepeatRate,
+            "dmQuestionRate": dmQuestionRate,
+            "dmExclamationRate": dmExclamationRate,
+            "dmEmojiRate": dmEmojiRate,
+            **keywordSignals,
             "asrKeyword": asrKeyword,
             "topicChange": topicVec,
             "speakerChange": speakerChange,
@@ -333,13 +416,24 @@ def _extractTextFeaturesImpl(
             "sampleRate": 1,
             "duration": nSecs,
             "status": "ok" if featureCount else "empty",
-            "generatorVersion": "signalText/2",
+            "generatorVersion": "signalText/3",
             "featureCount": featureCount,
             "stats": {
                 "danmakuEntries": len(danmakuEntries),
                 "skippedOutOfRange": skippedOutOfRange,
                 "asrSegments": len(asrSegments),
                 "durationSource": "explicit" if durationSec else "inferred",
+                "sentimentMode": _cfg.sentiment_mode,
+                "rateWindowRadius": _cfg.dm_rate_window_radius,
+                "utr": {
+                    "threshold": round(float(effectiveUtr), 4),
+                    "source": utrSource,
+                    "samples": len(utrSamples),
+                },
+                "keywordCategoryMax": {
+                    name: round(max(values), 4) if values else 0.0
+                    for name, values in keywordSignals.items()
+                },
             },
             "features": featureDict,
         }
@@ -465,16 +559,239 @@ def _fastSentiment(words: list[str], pool=None, holdings: list[str] | None = Non
             # is still considered available so we keep trying subsequent texts.
             log.debug("HF sentiment inference failed for one text", exc_info=True)
 
-    # Fallback: rule-based
-    positive = {"哈哈", "好", "nice", "牛", "赞", "喜欢", "漂亮", "精彩", "笑", "乐"}
-    negative = {"无语", "差", "垃圾", "退", "骗", "恶心", "翻车"}
-    pos = sum(1 for w in words if w in positive)
-    neg = sum(1 for w in words if w in negative)
+    return _ruleSentiment(words)
+
+
+def _ruleSentiment(words: list[str]) -> float:
+    """Cheap lexicon sentiment used before any transformer inference."""
+    if not words:
+        return 0.0
+    pos = sum(1 for word in words if word in _RULE_POSITIVE)
+    neg = sum(1 for word in words if word in _RULE_NEGATIVE)
     if pos > neg:
         return 0.5
     if neg > pos:
         return -0.5
     return 0.0
+
+
+def _sentimentForWords(
+    words: list[str],
+    pool=None,
+    holdings: list[str] | None = None,
+) -> float:
+    """Apply the configured sentiment strategy.
+
+    ``rules`` avoids per-message transformer calls entirely; ``hybrid`` only
+    falls back to the model when the lexicon is neutral; ``hf`` preserves the
+    legacy per-message behaviour.
+    """
+    ruleScore = _ruleSentiment(words)
+    mode = str(_cfg.sentiment_mode).lower()
+    if mode == "rules":
+        return ruleScore
+    if mode == "hybrid" and ruleScore != 0.0:
+        return ruleScore
+    return _fastSentiment(words, pool, holdings)
+
+
+def _normalizeDanmaku(text: str) -> str:
+    """Normalise a message for duplicate detection."""
+    return re.sub(r"\s+", "", text.strip().lower())
+
+
+def _textHasEmoji(text: str) -> bool:
+    """Return True when a message contains a Unicode emoji or bracket emote."""
+    return bool(_EMOJI_PATTERN.search(text))
+
+
+def _prefixSums(values: list[float]) -> list[float]:
+    """Inclusive prefix sums with a leading zero."""
+    prefix = [0.0]
+    total = 0.0
+    for value in values:
+        total += float(value)
+        prefix.append(total)
+    return prefix
+
+
+def _computeMessageRate(
+    allText30s: list[list[str]],
+    predicate,
+    radius: int | None = None,
+) -> list[float]:
+    """Sliding-window fraction of messages satisfying ``predicate``."""
+    nSecs = len(allText30s)
+    if nSecs == 0:
+        return []
+    windowRadius = (
+        _cfg.dm_rate_window_radius if radius is None else max(0, int(radius))
+    )
+    hits = [0.0] * nSecs
+    totals = [0.0] * nSecs
+    for sec, texts in enumerate(allText30s):
+        totals[sec] = float(len(texts))
+        hits[sec] = float(sum(1 for text in texts if predicate(text)))
+
+    hitPrefix = _prefixSums(hits)
+    totalPrefix = _prefixSums(totals)
+    result = [0.0] * nSecs
+    for sec in range(nSecs):
+        lo = max(0, sec - windowRadius)
+        hi = min(nSecs, sec + windowRadius + 1)
+        total = totalPrefix[hi] - totalPrefix[lo]
+        if total > 0:
+            result[sec] = (hitPrefix[hi] - hitPrefix[lo]) / total
+    return result
+
+
+def _computeRepeatRate(
+    allText30s: list[list[str]],
+    radius: int | None = None,
+) -> list[float]:
+    """Sliding-window fraction of duplicate (normalised) messages."""
+    nSecs = len(allText30s)
+    if nSecs == 0:
+        return []
+    windowRadius = (
+        _cfg.dm_rate_window_radius if radius is None else max(0, int(radius))
+    )
+    result = [0.0] * nSecs
+    for sec in range(nSecs):
+        lo = max(0, sec - windowRadius)
+        hi = min(nSecs, sec + windowRadius + 1)
+        normalised = [
+            _normalizeDanmaku(text)
+            for texts in allText30s[lo:hi]
+            for text in texts
+            if text.strip()
+        ]
+        if normalised:
+            result[sec] = (len(normalised) - len(set(normalised))) / len(normalised)
+    return result
+
+
+def _canonicalKeywordCategory(name: object) -> str | None:
+    """Map config spellings (highEnergy / high_energy) to a canonical key."""
+    key = re.sub(r"[^a-z]", "", str(name).lower())
+    return _CATEGORY_ALIASES.get(key)
+
+
+def _computeKeywordCategorySignals(
+    allText30s: list[list[str]],
+    keywordDict: dict,
+    asrSegments: list[dict] | None = None,
+    radius: int | None = None,
+) -> dict[str, list[float]]:
+    """Build per-category keyword intensity signals.
+
+    Danmaku contribute a smoothed hit rate (60% weight); ASR segments that
+    contain a category phrase add a binary event (40% weight).  The result
+    stays in 0..1 so it can be compared across recordings.
+    """
+    nSecs = len(allText30s)
+    if nSecs == 0:
+        return {name: [] for name in KEYWORD_CATEGORY_FEATURES.values()}
+
+    windowRadius = (
+        _cfg.dm_rate_window_radius if radius is None else max(0, int(radius))
+    )
+    categoryKeywords: dict[str, list[str]] = {}
+    for rawName, values in (keywordDict or {}).items():
+        category = _canonicalKeywordCategory(rawName)
+        if category is None or not isinstance(values, list):
+            continue
+        keywords = [
+            str(value).strip().lower()
+            for value in values
+            if str(value).strip()
+        ]
+        if keywords:
+            categoryKeywords[category] = keywords
+
+    dmHits = {category: [0.0] * nSecs for category in categoryKeywords}
+    totals = [float(len(texts)) for texts in allText30s]
+    for sec, texts in enumerate(allText30s):
+        for text in texts:
+            lower = text.lower()
+            for category, keywords in categoryKeywords.items():
+                if any(keyword in lower for keyword in keywords):
+                    dmHits[category][sec] += 1.0
+
+    asrHits = {category: [0.0] * nSecs for category in categoryKeywords}
+    for segment in asrSegments or []:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").lower()
+        if not text:
+            continue
+        matched = [
+            category for category, keywords in categoryKeywords.items()
+            if any(keyword in text for keyword in keywords)
+        ]
+        if not matched:
+            continue
+        try:
+            start = int(segment.get("start") or 0)
+            end = int(np.ceil(float(segment.get("end") or 0)))
+        except (TypeError, ValueError):
+            continue
+        start = max(0, min(start, nSecs))
+        end = max(start, min(end, nSecs))
+        for sec in range(start, end):
+            for category in matched:
+                asrHits[category][sec] = 1.0
+
+    totalPrefix = _prefixSums(totals)
+    signals: dict[str, list[float]] = {}
+    for category, featureName in KEYWORD_CATEGORY_FEATURES.items():
+        hits = dmHits.get(category)
+        if hits is None:
+            signals[featureName] = [0.0] * nSecs
+            continue
+        hitPrefix = _prefixSums(hits)
+        asr = asrHits.get(category, [0.0] * nSecs)
+        values = [0.0] * nSecs
+        for sec in range(nSecs):
+            lo = max(0, sec - windowRadius)
+            hi = min(nSecs, sec + windowRadius + 1)
+            total = totalPrefix[hi] - totalPrefix[lo]
+            dmRate = (hitPrefix[hi] - hitPrefix[lo]) / total if total > 0 else 0.0
+            values[sec] = min(1.0, 0.6 * dmRate + 0.4 * asr[sec])
+        signals[featureName] = values
+    return signals
+
+
+def _calibrateUtrThreshold(
+    utrValues: list[float],
+    configured: float,
+    percentile: float | None = None,
+    minSamples: int | None = None,
+    low: float | None = None,
+    high: float | None = None,
+) -> tuple[float, str]:
+    """Calibrate the anti-spam threshold from observed UTR values.
+
+    Returns ``(threshold, source)`` where source is ``calibrated`` or
+    ``configured``.  Sparse recordings fall back to the configured value.
+    """
+    percentile = (
+        _cfg.utr_calibration_percentile if percentile is None else float(percentile)
+    )
+    minSamples = (
+        _cfg.utr_calibration_min_samples if minSamples is None else int(minSamples)
+    )
+    low = _cfg.utr_calibration_min if low is None else float(low)
+    high = _cfg.utr_calibration_max if high is None else float(high)
+
+    values = [
+        float(value) for value in utrValues
+        if np.isfinite(value) and float(value) > 0
+    ]
+    if len(values) < max(1, minSamples):
+        return float(configured), "configured"
+    quantile = float(np.percentile(values, percentile))
+    return min(high, max(low, quantile)), "calibrated"
 
 
 def _computeUtr(allText30s: list[list[str]]) -> list[float]:

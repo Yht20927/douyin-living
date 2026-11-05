@@ -83,6 +83,13 @@ class TestTextSettingsDefaults:
         assert s.similarity_threshold == 0.7
         assert s.utr_threshold == 0.3
         assert s.sentiment_max_len == 512
+        assert s.utr_auto_calibrate is True
+        assert s.utr_calibration_percentile == 20.0
+        assert s.utr_calibration_min_samples == 60
+        assert s.utr_calibration_min == 0.15
+        assert s.utr_calibration_max == 0.6
+        assert s.dm_rate_window_radius == 5
+        assert s.sentiment_mode == "rules"
 
 
 class TestVisualSettingsDefaults:
@@ -141,6 +148,23 @@ class TestEnvironmentOverrides:
         monkeypatch.setenv("PIPELINE_MIN_DURATION_DEFAULT", "8.5")
         settings = PipelineSettings()
         assert settings.min_duration_default == 8.5
+
+    def test_text_engagement_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("TEXT_UTR_AUTO_CALIBRATE", "false")
+        monkeypatch.setenv("TEXT_UTR_CALIBRATION_PERCENTILE", "10")
+        monkeypatch.setenv("TEXT_UTR_CALIBRATION_MIN_SAMPLES", "30")
+        monkeypatch.setenv("TEXT_UTR_CALIBRATION_MIN", "0.2")
+        monkeypatch.setenv("TEXT_UTR_CALIBRATION_MAX", "0.5")
+        monkeypatch.setenv("TEXT_DM_RATE_WINDOW_RADIUS", "3")
+        monkeypatch.setenv("TEXT_SENTIMENT_MODE", "hybrid")
+        settings = TextSettings()
+        assert settings.utr_auto_calibrate is False
+        assert settings.utr_calibration_percentile == 10.0
+        assert settings.utr_calibration_min_samples == 30
+        assert settings.utr_calibration_min == 0.2
+        assert settings.utr_calibration_max == 0.5
+        assert settings.dm_rate_window_radius == 3
+        assert settings.sentiment_mode == "hybrid"
 
     def test_pipeline_asr_env_overrides(self, monkeypatch):
         monkeypatch.setenv("PIPELINE_ASR_MODEL", "tiny")
@@ -241,3 +265,7 @@ class TestStructuralValidation:
                 topic_kmeans_clusters_min=6,
                 topic_kmeans_clusters_max=3,
             )
+
+    def test_text_utr_calibration_bounds(self):
+        with pytest.raises(ValidationError, match="utr_calibration_min"):
+            TextSettings(utr_calibration_min=0.8, utr_calibration_max=0.4)

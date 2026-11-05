@@ -147,6 +147,7 @@ data/300294032039/
 
 ```
 弹幕信号 ──→ 密度/加速度/熵值/情感/去重/反刷屏
+             重复率/问号率/感叹号率/emoji 率/关键词类别强度
 音频信号 ──→ RMS/频谱质心/MFCC/过零率/笑声/掌声
 视觉信号 ──→ 场景切换/光流运动/人脸数量
 ASR 信号 ──→ 关键词匹配/说话人交替/话题切换
@@ -192,6 +193,23 @@ game 15~60s、default 15~90s；用户 `--min-duration/--max-duration` 始终是�
 `contentType/targetDuration/boundary.startSource/boundary.endSource/boundary.reasons`，
 被移动的边界会额外记录 `boundary_optimized` adjustment。
 `dynamicDuration`、`boundarySearchSec`、`platform` 也进入 scorer 缓存 key。
+
+### 文本特征（Sprint 5 / S5-3）
+
+- 新增按秒信号：`dmRepeatRate`、`dmQuestionRate`、`dmExclamationRate`、`dmEmojiRate`；
+- 新增关键词类别强度：`keywordHighEnergy`、`keywordFunny`、`keywordControversy`、
+  `keywordInteractive`、`keywordEmotional`、`keywordShopping`，由弹幕命中率与
+  ASR 短语命中共同构成（0~1）；
+- `config/keywords.json` 增加带货话术与直播常用短语，旧的 `asrKeyword` 契约保持不变；
+- `dmUniqueUsers` 进入所有 profile 权重，真实互动人数不再只是诊断字段；
+- `sentiment_mode=rules|hybrid|hf`：默认 `rules`，跳过逐条弹幕 HF 推理；
+  `hybrid` 只对规则中性文本调用 HF，`hf` 保留旧行为；
+- `utr_auto_calibrate=true` 时，从本场有弹幕秒的 UTR 分布取低分位数作为反刷屏阈值，
+  并限制在 `utr_calibration_min~max`；样本不足时回退到 `utr_threshold`。
+  实际阈值与来源写入 `text_features.json` 的 `stats.utr`。
+
+相关参数位于 `config/text.yaml`，均支持 `TEXT_*` 环境变量。由于特征输出扩展，
+`GENERATOR_VERSION` 已提升到 `sprint5`，旧派生产物会自动重建。
 
 ### 直播类型预设
 
@@ -248,7 +266,7 @@ game 15~60s、default 15~90s；用户 `--min-duration/--max-duration` 始终是�
 |------|------|
 | `docs/runbook.md` | 运行手册：Cookie/无流/ffmpeg/模型/磁盘/ASR OOM 与日志排查 |
 | `docs/superpowers/specs/2026-06-03-ai-clip-design.md` | AI 切片系统完整设计文档 |
-| `config/keywords.json` | 关键词词典（高能/搞笑/争议/互动/情感） |
+| `config/keywords.json` | 关键词词典（高能/搞笑/争议/互动/情感/带货） |
 
 ---
 

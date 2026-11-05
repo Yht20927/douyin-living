@@ -643,6 +643,17 @@ src/pipeline/
 - 情感分析改为批量推理或“规则优先 + 候选窗口 HF”；
 - UTR 阈值用真实数据分布校准，不继续拍脑袋。
 
+> **S5-3 执行记录（2026-11-05）**：
+>
+> - `signalText.py` 新增按秒特征 `dmRepeatRate`、`dmQuestionRate`、`dmExclamationRate`、`dmEmojiRate`：重复率按 10s 滑动窗口内归一化消息去重计算，问号/感叹号/emoji 按消息占比计算；emoji 同时识别 Unicode 表情和 `[笑哭]` 类弹幕表情。
+> - 关键词按类别输出 0~1 强度：`keywordHighEnergy/keywordFunny/keywordControversy/keywordInteractive/keywordEmotional/keywordShopping`。弹幕命中率占 60%，ASR 段落命中事件占 40%；保留旧 `asrKeyword` 二值契约。
+> - `config/keywords.json` 扩展为六类话术词典（新增 shopping，并补充“扣1”“来了”“真的假的”“上车”“库存”“最后一批”“秒杀”等直播短语）；`dmUniqueUsers` 进入 default/game/shopping/talent 四个 profile 的权重，带货 profile 对 `keywordShopping` 给予最高类别权重。
+> - 情感分析改为可配置策略：`sentiment_mode=rules|hybrid|hf`，默认 `rules` 完全跳过逐条弹幕 HF 推理；`hybrid` 仅对规则中性文本调用 HF；`hf` 保留旧行为。`_fastSentiment` 继续保留并复用规则词典。
+> - UTR 反刷屏阈值支持数据校准：`utr_auto_calibrate=true` 时取本场有弹幕秒 UTR 的 20 分位，并限制在 0.15~0.6；样本不足 60 秒时回退 `utr_threshold`。实际阈值、来源与样本数写入 `text_features.json` 的 `stats.utr`。
+> - 两阶段链路同步接入：新类别信号进入 profile 召回曲线与精排语义 bonus，并补充标题/标签映射（带货、搞笑、高能、互动、情感、争议）；`GENERATOR_VERSION` 提升到 `sprint5`，旧派生缓存会自动重建。
+> - 新增/扩展测试覆盖重复率、标点与 emoji 比率、类别信号、规则情感、UTR 校准、配置项、时间轴可见性、stage2 类别标签与 profile 权重。全量 **495 passed**，覆盖率 **86%**，`ruff check src tests` 与 `git diff --check` 全绿。
+> - 仍待后续完成：真实标注数据上的 UTR 分位与类别权重校准、候选窗口级 HF 批量推理、文本特征对 Precision@K/Boundary IoU 的离线评估。
+
 ### S5-4 视觉性能优化
 
 - 用 ffmpeg 生成低分辨率代理流（如 `fps=2, scale=480:-2`），场景/运动只在代理上计算；

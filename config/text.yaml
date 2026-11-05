@@ -9,6 +9,18 @@ sentiment_max_len: 512
 fasttext_model_path: "models/cc.zh.300.bin"
 text2vec_model: "shibing624/text2vec-base-chinese"
 utr_window_radius: 30
+# Calibrate the anti-spam threshold from the recording's own UTR distribution.
+# Falls back to utr_threshold when fewer than min_samples seconds have text.
+utr_auto_calibrate: true
+utr_calibration_percentile: 20.0
+utr_calibration_min_samples: 60
+utr_calibration_min: 0.15
+utr_calibration_max: 0.6
+# Sliding-window radius for repeat/question/exclamation/emoji rates.
+dm_rate_window_radius: 5
+# rules: no per-message HF inference; hybrid: rules first, HF for neutral
+# messages; hf: legacy per-message HF with rule fallback.
+sentiment_mode: "rules"
 entropy_window_radius: 5
 entropy_msg_cap: 200
 entropy_top_words: 50

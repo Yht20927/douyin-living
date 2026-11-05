@@ -184,6 +184,31 @@ class TestRerankRanking:
         )
         assert "window_adjusted" in clip["risks"]
 
+    def test_keyword_category_is_ranked_and_tagged(self):
+        n = 200
+        keywordShopping = np.zeros(n)
+        keywordShopping[50:80] = 1.0
+        result = rerankCandidates(
+            [{
+                "start": 50.0,
+                "end": 80.0,
+                "score": 1.0,
+                "sources": ["keywordShopping"],
+            }],
+            durationSec=n,
+            textFeatures={"features": {
+                "keywordShopping": keywordShopping.tolist(),
+            }},
+            minDuration=15.0,
+            maxDuration=60.0,
+            boundarySearchSec=0.0,
+        )
+        clip = result["clips"][0]
+        assert "keywordShopping" in clip["reasons"]
+        assert "带货" in clip["tags"]
+        assert clip["title"].startswith("🛒")
+        assert clip["score"] > 0
+
     def test_missing_asr_is_reported_as_risk(self):
         n = 120
         rms = np.zeros(n)

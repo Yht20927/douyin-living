@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = "1.0"
-GENERATOR_VERSION = "sprint4"
+GENERATOR_VERSION = "sprint5"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _PROJECT_ROOT / "config"

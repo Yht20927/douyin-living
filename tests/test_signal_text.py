@@ -12,16 +12,25 @@ import pytest
 
 import src.signalText as signalText
 from src.signalText import (
-    _fuzzyMatchCached,
-    _computeUtr,
+    KEYWORD_CATEGORY_FEATURES,
+    _calibrateUtrThreshold,
+    _canonicalKeywordCategory,
     _computeEntropyWindow,
+    _computeKeywordCategorySignals,
+    _computeMessageRate,
+    _computeRepeatRate,
     _computeTopicChange,
+    _computeUtr,
     _fastSentiment,
-    _secondDerivative,
-    _parseTimestamp,
+    _fuzzyMatchCached,
     _getContent,
     _getUserId,
+    _parseTimestamp,
     _resolveDuration,
+    _ruleSentiment,
+    _secondDerivative,
+    _sentimentForWords,
+    _textHasEmoji,
     POOL_NAME_TEXT2VEC,
     SIMILARITY_THRESHOLD,
 )
@@ -272,6 +281,132 @@ class TestFastSentiment:
 
         monkeypatch.setattr(signalText, "_sentimentPipeline", broken)
         assert _fastSentiment(["哈哈"]) == 0.5
+
+
+class TestRuleSentiment:
+    def test_positive_negative_neutral(self):
+        assert _ruleSentiment(["哈哈", "真", "好"]) == 0.5
+        assert _ruleSentiment(["无语", "翻车"]) == -0.5
+        assert _ruleSentiment(["今天", "天气"]) == 0.0
+        assert _ruleSentiment([]) == 0.0
+
+    def test_rules_mode_never_calls_model(self, monkeypatch):
+        monkeypatch.setattr(signalText._cfg, "sentiment_mode", "rules")
+        monkeypatch.setattr(
+            signalText,
+            "_fastSentiment",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("model must not be called")
+            ),
+        )
+        assert _sentimentForWords(["哈哈"]) == 0.5
+        assert _sentimentForWords(["今天"]) == 0.0
+
+    def test_hybrid_only_calls_model_for_neutral(self, monkeypatch):
+        calls = []
+
+        def fakeFastSentiment(words, pool=None, holdings=None):
+            calls.append(list(words))
+            return 0.9
+
+        monkeypatch.setattr(signalText._cfg, "sentiment_mode", "hybrid")
+        monkeypatch.setattr(signalText, "_fastSentiment", fakeFastSentiment)
+        assert _sentimentForWords(["哈哈"]) == 0.5
+        assert calls == []
+        assert _sentimentForWords(["今天"]) == 0.9
+        assert calls == [["今天"]]
+
+
+class TestDanmakuRates:
+    def test_repeat_rate_detects_duplicates(self):
+        texts = [["666", "666", "上链接"], [], []]
+        rate = _computeRepeatRate(texts, radius=0)
+        assert rate[0] == pytest.approx(1.0 / 3.0)
+        assert rate[1:] == [0.0, 0.0]
+
+    def test_repeat_rate_normalises_case_and_spaces(self):
+        assert _computeRepeatRate([["Spam", " spam "]], radius=0) == [0.5]
+
+    def test_repeat_rate_empty(self):
+        assert _computeRepeatRate([], radius=5) == []
+        assert _computeRepeatRate([[], []], radius=1) == [0.0, 0.0]
+
+    def test_question_rate(self):
+        texts = [["真的吗？"], ["好"], ["怎么弄?"]]
+        rate = _computeMessageRate(
+            texts,
+            lambda text: any(marker in text for marker in ("?", "？")),
+            radius=0,
+        )
+        assert rate == [1.0, 0.0, 1.0]
+
+    def test_exclamation_and_emoji_rates(self):
+        texts = [["好！"], ["🙂"], ["[笑哭]"], ["普通"]]
+        exclamation = _computeMessageRate(
+            texts,
+            lambda text: any(marker in text for marker in ("!", "！")),
+            radius=0,
+        )
+        emoji = _computeMessageRate(texts, _textHasEmoji, radius=0)
+        assert exclamation == [1.0, 0.0, 0.0, 0.0]
+        assert emoji == [0.0, 1.0, 1.0, 0.0]
+
+    def test_emoji_detection(self):
+        assert _textHasEmoji("😂")
+        assert _textHasEmoji("[捂脸]")
+        assert not _textHasEmoji("普通弹幕")
+
+
+class TestKeywordCategories:
+    def test_category_signals_combine_danmaku_and_asr(self):
+        texts = [["666"], [], ["上链接"]]
+        signals = _computeKeywordCategorySignals(
+            texts,
+            {
+                "highEnergy": ["666"],
+                "shopping": ["上链接", "库存"],
+                "unknownCategory": ["x"],
+            },
+            asrSegments=[{"start": 1, "end": 2, "text": "库存最后一批"}],
+            radius=0,
+        )
+        assert set(signals) == set(KEYWORD_CATEGORY_FEATURES.values())
+        assert signals["keywordHighEnergy"][0] == pytest.approx(0.6)
+        assert signals["keywordShopping"][0] == 0.0
+        assert signals["keywordShopping"][1] == pytest.approx(0.4)
+        assert signals["keywordShopping"][2] == pytest.approx(0.6)
+        assert signals["keywordFunny"] == [0.0, 0.0, 0.0]
+
+    def test_category_aliases(self):
+        assert _canonicalKeywordCategory("highEnergy") == "highEnergy"
+        assert _canonicalKeywordCategory("high_energy") == "highEnergy"
+        assert _canonicalKeywordCategory("unknown") is None
+
+    def test_empty_inputs_return_zero_arrays(self):
+        signals = _computeKeywordCategorySignals([], {"shopping": ["上车"]})
+        assert all(values == [] for values in signals.values())
+
+
+class TestUtrCalibration:
+    def test_sparse_data_keeps_configured_threshold(self):
+        threshold, source = _calibrateUtrThreshold(
+            [0.2] * 5, 0.3, percentile=20, minSamples=20, low=0.15, high=0.6
+        )
+        assert (threshold, source) == (0.3, "configured")
+
+    def test_calibrates_from_distribution(self):
+        values = [0.1 + index * 0.01 for index in range(100)]
+        threshold, source = _calibrateUtrThreshold(
+            values, 0.3, percentile=20, minSamples=50, low=0.15, high=0.6
+        )
+        assert source == "calibrated"
+        assert threshold == pytest.approx(0.29, abs=0.02)
+
+    def test_clamps_to_safe_bounds(self):
+        threshold, _ = _calibrateUtrThreshold(
+            [0.95] * 100, 0.3, percentile=20, minSamples=50, low=0.15, high=0.6
+        )
+        assert threshold == 0.6
 
 
 class TestComputeTopicChange:

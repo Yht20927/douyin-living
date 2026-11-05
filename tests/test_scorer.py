@@ -193,6 +193,16 @@ class TestScoreIntegration:
         for name, prof in PROFILES.items():
             assert set(prof.keys()) == default_keys, f"Profile '{name}' keys differ"
 
+    def test_new_text_features_are_weighted(self):
+        """S5-3 signals must not be silently dropped by every profile."""
+        for name, prof in PROFILES.items():
+            assert prof["dmUniqueUsers"] > 0, name
+            assert prof["keywordHighEnergy"] > 0, name
+        assert (
+            PROFILES["shopping"]["keywordShopping"]
+            > PROFILES["default"]["keywordShopping"]
+        )
+
     def test_short_recording_produces_clips(self):
         """Recordings ≤60s must not produce all-zero Z-scores."""
         n = 30

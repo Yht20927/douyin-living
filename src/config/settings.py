@@ -273,6 +273,15 @@ class TextSettings(_YamlSectionSettings):
     fasttext_model_path: str = Field(default="models/cc.zh.300.bin")
     text2vec_model: str = Field(default="shibing624/text2vec-base-chinese")
     utr_window_radius: int = Field(default=30, ge=1)
+    utr_auto_calibrate: bool = True
+    utr_calibration_percentile: float = Field(default=20.0, ge=1.0, le=50.0)
+    utr_calibration_min_samples: int = Field(default=60, ge=1)
+    utr_calibration_min: float = Field(default=0.15, gt=0.0, le=1.0)
+    utr_calibration_max: float = Field(default=0.6, gt=0.0, le=1.0)
+    dm_rate_window_radius: int = Field(default=5, ge=0)
+    sentiment_mode: str = Field(
+        default="rules", pattern=r"^(rules|hybrid|hf)$"
+    )
     entropy_window_radius: int = Field(default=5, ge=0)
     entropy_msg_cap: int = Field(default=200, ge=1)
     entropy_top_words: int = Field(default=50, ge=1)
@@ -288,6 +297,10 @@ class TextSettings(_YamlSectionSettings):
         if self.topic_kmeans_clusters_min > self.topic_kmeans_clusters_max:
             raise ValueError(
                 "topic_kmeans_clusters_min must not exceed topic_kmeans_clusters_max"
+            )
+        if self.utr_calibration_min > self.utr_calibration_max:
+            raise ValueError(
+                "utr_calibration_min must not exceed utr_calibration_max"
             )
         return self
 

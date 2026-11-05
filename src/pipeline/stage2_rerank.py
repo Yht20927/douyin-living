@@ -49,6 +49,12 @@ log = getLogger(__name__)
 
 TRIGGER_TITLES = (
     ("asrKeyword", "💬 关键词片段"),
+    ("keywordShopping", "🛒 带货爆点"),
+    ("keywordFunny", "😂 搞笑高能"),
+    ("keywordHighEnergy", "🔥 高能时刻"),
+    ("keywordInteractive", "💬 互动高光"),
+    ("keywordEmotional", "💗 情感时刻"),
+    ("keywordControversy", "⚡ 争议片段"),
     ("eventLaughter", "😂 搞笑高能"),
     ("eventApplause", "👏 精彩时刻"),
     ("dmDensity", "🔥 弹幕爆发"),
@@ -61,6 +67,12 @@ TRIGGER_TITLES = (
 
 TAG_MAP = {
     "asrKeyword": "关键词",
+    "keywordHighEnergy": "高能",
+    "keywordFunny": "搞笑",
+    "keywordControversy": "争议",
+    "keywordInteractive": "互动",
+    "keywordEmotional": "情感",
+    "keywordShopping": "带货",
     "eventLaughter": "搞笑",
     "eventApplause": "精彩",
     "dmDensity": "互动",
@@ -76,6 +88,12 @@ TAG_MAP = {
 SEMANTIC_BOOSTS = {
     "eventLaughter": 0.18,
     "asrKeyword": 0.15,
+    "keywordHighEnergy": 0.06,
+    "keywordFunny": 0.10,
+    "keywordControversy": 0.04,
+    "keywordInteractive": 0.06,
+    "keywordEmotional": 0.06,
+    "keywordShopping": 0.04,
     "speakerChange": 0.12,
     "eventApplause": 0.12,
     "eventMusic": 0.08,

@@ -111,8 +111,11 @@ class TestScoreAlignment:
         n = 40
         textNames = [
             "dmDensity", "dmAcceleration", "dmEntropy", "dmSentiment",
-            "dmUniqueUsers", "dmUtr", "asrKeyword", "topicChange",
-            "speakerChange",
+            "dmUniqueUsers", "dmUtr", "dmRepeatRate", "dmQuestionRate",
+            "dmExclamationRate", "dmEmojiRate", "keywordHighEnergy",
+            "keywordFunny", "keywordControversy", "keywordInteractive",
+            "keywordEmotional", "keywordShopping", "asrKeyword",
+            "topicChange", "speakerChange",
         ]
         audioNames = [
             "rms", "spectralCentroid", "mfccDist", "zcr",

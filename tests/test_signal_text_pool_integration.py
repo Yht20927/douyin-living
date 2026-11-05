@@ -177,6 +177,24 @@ class TestPoolReleaseDiscipline:
             if name in pool.resident:
                 assert pool.evict(name), f"{name} leaked after exception"
 
+    def test_new_text_features_are_emitted_with_metadata(
+        self, _stub_modules, _tiny_inputs
+    ):
+        danmakuPath, asrPath = _tiny_inputs
+        result = signalText.extractFeatures(danmakuPath, asrPath)
+
+        expected = {
+            "dmRepeatRate", "dmQuestionRate", "dmExclamationRate", "dmEmojiRate",
+            "keywordHighEnergy", "keywordFunny", "keywordControversy",
+            "keywordInteractive", "keywordEmotional", "keywordShopping",
+        }
+        assert expected <= set(result["features"])
+        assert result["generatorVersion"] == "signalText/3"
+        assert result["stats"]["sentimentMode"] == "rules"
+        # Only 4 seconds of text: calibration must fall back to config.
+        assert result["stats"]["utr"]["source"] == "configured"
+        assert result["stats"]["utr"]["samples"] == 2
+
     def test_consecutive_extracts_dont_inflate_refcount(self, _stub_modules, _tiny_inputs):
         """Three back-to-back runs must leave each model at refcount=0.
 
