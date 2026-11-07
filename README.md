@@ -146,9 +146,10 @@ data/300294032039/
 │   └── media/                             ← 从源视频提取的缩略帧
 ├── *.meta.json                            ← 产物缓存元数据（源 hash/配置 hash）
 └── highlights/
-    ├── clip_342s_dmDensity+asrKeyword.mp4 ← 切片视频
-    ├── clip_342s_dmDensity+asrKeyword.srt ← 切片字幕
-    ├── clip_342s_dmDensity+asrKeyword.jpg ← 封面缩略图
+    ├── clip_342s_dmDensity+asrKeyword.mp4  ← 切片视频
+    ├── clip_342s_dmDensity+asrKeyword.srt  ← 切片字幕
+    ├── clip_342s_dmDensity+asrKeyword.jpg  ← 封面缩略图
+    ├── clip_342s_dmDensity+asrKeyword.json ← 片段元数据/审核清单（S6-2）
     └── ...
 ```
 
@@ -378,6 +379,42 @@ python -m src.controller 300294032039 --clip-only --dry-run \
 
 报告生成失败只记录 warning，不会中断评分/裁剪主流程。报告中的分数尚未
 经过人工标注校准，不能直接当作质量结论。
+
+### 片段元数据（Sprint 6 / S6-2）
+
+实际裁剪后，`highlights/` 中每个片段都会获得与 `.mp4` 同 stem 的 `.json`
+审核清单；`--dry-run` 不生成：
+
+```json
+{
+  "clipId": 1,
+  "start": 342.0,
+  "end": 367.0,
+  "duration": 25.0,
+  "score": 0.91,
+  "confidence": 0.82,
+  "title": "弹幕爆发 + 关键词命中",
+  "tags": ["互动", "搞笑"],
+  "reasons": ["dmDensity", "asrKeyword"],
+  "risks": ["asr_missing"],
+  "suggestedAction": "review",
+  "scoreBreakdown": {"dmDensity": 0.31, "asrKeyword": 0.22},
+  "assets": {
+    "video": "clip_342s_dmDensity+asrKeyword.mp4",
+    "srt": "clip_342s_dmDensity+asrKeyword.srt",
+    "thumbnail": "clip_342s_dmDensity+asrKeyword.jpg"
+  }
+}
+```
+
+- `reasons` 优先使用两阶段评分给出的原因；legacy 片段回退到 `trigger` 与
+  `breakdown` 中正贡献的 key；
+- `confidence` 仅两阶段评分提供，legacy 片段为 `null`；
+- `suggestedAction`：有 `dropReasons` → `drop`，有 `risks` → `review`，否则
+  `keep`，只是人工审核提示；
+- `assets` 记录同 stem 的实际文件，缺失的 SRT/封面为 `null`；
+- 元数据写入失败只记 warning（`pipeline_status.json` 的
+  `9_subtitles_thumbnails.meta.metadataFailures`），不会中断裁剪。
 
 ### 直播类型预设
 

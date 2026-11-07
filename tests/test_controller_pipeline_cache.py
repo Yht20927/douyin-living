@@ -635,3 +635,73 @@ class TestDryRunReport:
         status = loadStatus(pipelineEnv["outputDir"])
         assert status["steps"]["7_scorer"]["status"] == "ok"
         assert status["steps"]["8_clipping"]["meta"]["dryRun"] is True
+
+
+class TestClipMetadataArtifacts:
+    @staticmethod
+    def _metadataFiles(outputDir):
+        highlights = Path(outputDir) / "highlights"
+        return sorted(
+            path
+            for path in highlights.glob("clip_*.json")
+            if not path.name.endswith(".meta.json")
+        )
+
+    def test_normal_run_writes_metadata_for_each_clip(self, pipelineEnv):
+        outputDir = pipelineEnv["outputDir"]
+        runPipeline(outputDir)
+
+        metadataFiles = self._metadataFiles(outputDir)
+        assert len(metadataFiles) == 2
+        pairs = [
+            (path, json.loads(path.read_text(encoding="utf-8")))
+            for path in metadataFiles
+        ]
+        byId = {document["clipId"]: document for _, document in pairs}
+        assert set(byId) == {1, 2}
+        assert byId[1]["reasons"] == ["funny"]
+        assert byId[2]["reasons"] == ["highlight"]
+
+        for path, document in pairs:
+            assert path.with_suffix(".mp4").exists()
+            assert document["assets"] == {
+                "video": path.with_suffix(".mp4").name,
+                "srt": path.with_suffix(".srt").name,
+                "thumbnail": path.with_suffix(".jpg").name,
+            }
+            assert document["confidence"] is None
+            assert document["suggestedAction"] == "keep"
+
+        status = loadStatus(outputDir)
+        meta = status["steps"]["9_subtitles_thumbnails"]["meta"]
+        assert status["steps"]["9_subtitles_thumbnails"]["status"] == "ok"
+        assert meta["metadata"] == 2
+        assert meta["metadataFailures"] == 0
+
+    def test_dry_run_does_not_write_clip_metadata(self, pipelineEnv, monkeypatch):
+        monkeypatch.setattr(
+            "src.report._extractThumbnail", lambda *args, **kwargs: False
+        )
+
+        runPipeline(pipelineEnv["outputDir"], dryRun=True)
+
+        assert self._metadataFiles(pipelineEnv["outputDir"]) == []
+        status = loadStatus(pipelineEnv["outputDir"])
+        assert "9_subtitles_thumbnails" not in status["steps"]
+
+    def test_metadata_failure_does_not_abort_clipping(self, pipelineEnv, monkeypatch):
+        def explode(*args, **kwargs):
+            raise RuntimeError("metadata exploded")
+
+        monkeypatch.setattr("src.clipMeta.writeClipMetadata", explode)
+
+        runPipeline(pipelineEnv["outputDir"])
+
+        highlights = Path(pipelineEnv["outputDir"]) / "highlights"
+        assert len(list(highlights.glob("*.mp4"))) == 2
+        assert self._metadataFiles(pipelineEnv["outputDir"]) == []
+        status = loadStatus(pipelineEnv["outputDir"])
+        meta = status["steps"]["9_subtitles_thumbnails"]["meta"]
+        assert status["steps"]["9_subtitles_thumbnails"]["status"] == "ok"
+        assert meta["metadata"] == 0
+        assert meta["metadataFailures"] == 2

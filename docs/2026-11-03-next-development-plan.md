@@ -821,6 +821,17 @@ src/pipeline/
 
 同时保留：`mp4`、片段级 `srt`、`jpg` 封面。
 
+> **S6-2 执行记录（2026-11-07）**：
+>
+> - 新增 `src/clipMeta.py`：从 `time_table.json` 的 clip 构建统一审核元数据，按 `clipOutputPath` 同 stem 写出 `.json`，使用 `atomicWriteJson` 原子替换。
+> - schema 在计划样例上增加 `score` 与 `assets`（`video/srt/thumbnail` 文件名，缺失为 `null`）；`confidence` 仅两阶段评分提供，legacy 为 `null`。
+> - `reasons` 优先显式字段；legacy 回退到 `trigger` + `breakdown` 正贡献 key（按绝对值排序、去重）。非法数值归零，`NaN/Inf` 不写入。
+> - `suggestedAction`：有 `dropReasons` → `drop`；有 `risks` → `review`；否则 `keep`。只是审核提示，不是模型决策。
+> - controller step 9 在 SRT/封面 best-effort 生成后写元数据；失败只记 warning，新增 `metadata` / `metadataFailures` 状态字段，不中断裁剪。
+> - 新增 `tests/test_clip_meta.py` 与 controller 集成测试，覆盖 legacy/两阶段字段、原因回退、动作判定、资产缺失、原子重写、正常裁剪生成 JSON、dry-run 不生成、元数据失败不中断。
+> - 全量 **659 passed**，覆盖率 **88%**（`src/clipMeta.py` 98%），`ruff check src tests scripts` 与 `git diff --check` 全绿。
+> - 元数据只是规则化审核清单，未经人工标注校准，不代表片段质量结论。
+
 ### S6-3 竖屏与平台预设
 
 新增 `--target-platform douyin|bilibili|xiaohongshu`：

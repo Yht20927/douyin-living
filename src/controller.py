@@ -1357,12 +1357,16 @@ class Controller:
         # ── Step 9: segment-level SRT + thumbnails ─────────────
         log.info("Step 9: Generating subtitles and thumbnails...")
         status.startStep("9_subtitles_thumbnails")
+        from src.clipMeta import writeClipMetadata
+
         srtPath = asrPath.rsplit(".", 1)[0] + ".srt"
         srtFailures = 0
         thumbFailures = 0
+        metadataFailures = 0
+        metadataPaths: list[str] = []
         reusedArtifacts = 0
         generated: list[str] = []
-        for clipPath, clip in clipPaths:
+        for index, (clipPath, clip) in enumerate(clipPaths, start=1):
             # Generate clip-specific SRT — best effort, the clip itself is
             # already produced and usable without subtitles.
             clipSrtPath = clipPath.rsplit(".", 1)[0] + ".srt"
@@ -1400,10 +1404,28 @@ class Controller:
                 except Exception:
                     thumbFailures += 1
                     log.debug(f"Thumbnail failed for {clipPath}", exc_info=True)
+            # Metadata is written after the best-effort assets so its
+            # availability flags describe the files actually on disk.
+            try:
+                metadataPath = await asyncio.to_thread(
+                    writeClipMetadata,
+                    clip,
+                    clipPath,
+                    clipId=clip.get("id") if clip.get("id") is not None else index,
+                )
+                metadataPaths.append(metadataPath)
+                generated.append(metadataPath)
+            except Exception:
+                metadataFailures += 1
+                log.warning(f"Clip metadata failed for {clipPath}", exc_info=True)
         if srtFailures:
             log.warning(f"{srtFailures}/{len(clipPaths)} clips have no SRT")
         if thumbFailures:
             log.warning(f"{thumbFailures}/{len(clipPaths)} clips have no thumbnail")
+        if metadataFailures:
+            log.warning(
+                f"{metadataFailures}/{len(clipPaths)} clips have no metadata"
+            )
         allReused = clipsReused and reusedArtifacts == len(clipPaths) * 2
         status.finishStep(
             "9_subtitles_thumbnails",
@@ -1418,6 +1440,8 @@ class Controller:
             meta={
                 "srtFailures": srtFailures,
                 "thumbnailFailures": thumbFailures,
+                "metadataFailures": metadataFailures,
+                "metadata": len(metadataPaths),
                 "reusedArtifacts": reusedArtifacts,
             },
         )

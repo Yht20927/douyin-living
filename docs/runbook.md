@@ -667,6 +667,33 @@ python -m src.controller "$(basename "$DATA")" --clip-only --dry-run \
 | 弹幕 Top 词很少 | 该场次聊天文本少，或 jieba 未安装回退到 n-gram | 属于预期降级；可安装 `jieba` 后重生成报告 |
 | 报告里看不到召回区块 | 使用 legacy 评分或缺少 `recall_candidates.json` | 加 `--two-stage` 重跑评分 |
 
+### 10.6 片段元数据与资产（S6-2）
+
+实际裁剪（不带 `--dry-run`）完成后，每个 `highlights/clip_*.mp4` 旁边会生成
+同 stem 的 `.json` 审核清单，包含
+`clipId/start/end/duration/score/confidence/title/tags/reasons/risks/suggestedAction/scoreBreakdown/assets`。
+查看某次运行：
+
+```bash
+jq . data/300294032039/highlights/clip_342s_*.json
+jq '.steps["9_subtitles_thumbnails"].meta' data/300294032039/pipeline_status.json
+```
+
+- `assets.video` 必填；`assets.srt` / `assets.thumbnail` 在对应文件生成失败或
+  不存在时为 `null`；
+- `suggestedAction` 只是规则提示（`drop`/`review`/`keep`），不能替代人工判断；
+- `--dry-run` 不进入 step 9，因此不会生成片段 JSON；
+- 元数据失败只累计 `metadataFailures` 并输出 warning，不影响已生成的 mp4。
+
+排障：
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 没有 `clip_*.json` | `--dry-run`、片段时长不足 1s，或 step 9 未执行 | 去掉 `--dry-run`；检查 `pipeline_status.json` 的 `9_subtitles_thumbnails` |
+| `metadataFailures > 0` | 输出目录不可写、磁盘满或 JSON 序列化异常 | 查日志中的 `Clip metadata failed`；修复后重跑 `--from-step clip` |
+| `assets.thumbnail` / `assets.srt` 为 `null` | 对应 best-effort 产物生成失败 | 查 `thumbnailFailures` / `srtFailures` 与 ffmpeg 日志 |
+| legacy 片段 `confidence` 为 `null` | legacy 评分不输出 confidence | 需要置信度时使用 `--two-stage` |
+
 ---
 
 ## 11. 发布前 / 交付前检查
