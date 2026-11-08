@@ -147,10 +147,15 @@ def burnSubtitles(
 
 def generateClipSrt(
     srtPath: str, clipStart: float, clipEnd: float, outputPath: str
-):
-    """Extract SRT lines within a time range and offset to start at 0."""
+) -> bool:
+    """Extract SRT lines within a time range and offset to start at 0.
+
+    Returns True only when a subtitle file was written.  A missing source or a
+    range with no overlapping entries returns False so callers can report the
+    failure instead of silently claiming subtitles exist.
+    """
     if not os.path.exists(srtPath):
-        return
+        return False
     import re
     with open(srtPath, encoding="utf-8") as f:
         content = f.read()
@@ -187,10 +192,12 @@ def generateClipSrt(
 
         outBlocks.append(f"{counter}\n{fmtSrtTime(newStart)} --> {fmtSrtTime(newEnd)}\n{text}")
 
-    if outBlocks:
-        with open(outputPath, "w", encoding="utf-8") as f:
-            f.write("\n\n".join(outBlocks))
-        log.debug(f"Clip SRT: {outputPath} ({counter} entries)")
+    if not outBlocks:
+        return False
+    with open(outputPath, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(outBlocks))
+    log.debug(f"Clip SRT: {outputPath} ({counter} entries)")
+    return True
 
 
 

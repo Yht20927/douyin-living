@@ -832,6 +832,16 @@ src/pipeline/
 > - 全量 **659 passed**，覆盖率 **88%**（`src/clipMeta.py` 98%），`ruff check src tests scripts` 与 `git diff --check` 全绿。
 > - 元数据只是规则化审核清单，未经人工标注校准，不代表片段质量结论。
 
+> **真实房间回归修复（2026-11-08）**：
+>
+> - `Auth.fromEnv()` 支持 `DY_COOKIE_FILE` 与项目根 `cookie.txt`，兼容单行原始字符串和 Netscape 导出；优先级 `DY_LIVE_COOKIES` → `DY_COOKIES` → `DY_COOKIE_FILE` → `./cookie.txt`。
+> - Cookie 清洗会跳过非 ASCII 值（浏览器复制截断成 `…`）和非法名称，只记录条目名与数量，不输出 Cookie 值；单个坏条目不再导致所有请求失败。
+> - `generateClipSrt` 返回是否写出文件；源 SRT 缺失或片段区间无字幕计入 `9_subtitles_thumbnails.meta.srtFailures`，`assets.srt` 为 `null`，不再静默当作成功。
+> - ASR 在 CUDA 运行库缺失/加载失败（如 `libcublas.so.12`）时自动降级 CPU/int8 重试。真实房间复验：CUDA 失败后 CPU 转写 101 段/43s，3 个片段均生成非空 SRT。
+> - ASR 模型未缓存或网络不可达时，日志给出 `scripts/download_models.py` 与 `HF_ENDPOINT=https://hf-mirror.com` 提示；legacy 评分无峰时输出 `sensitivity`/`maxScore` 诊断并建议 `--two-stage`。
+> - `highlights/` 不会自动删除上一轮或切换评分模式前的片段产物；交付前应按本次 `time_table.json` 人工清理陈旧 `clip_*`（见 runbook 片段资产说明）。
+> - 全量 **669 passed**，覆盖率 **88%**，`ruff check src tests scripts` 与 `git diff --check` 全绿。
+
 ### S6-3 竖屏与平台预设
 
 新增 `--target-platform douyin|bilibili|xiaohongshu`：

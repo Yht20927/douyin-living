@@ -251,6 +251,59 @@ class TestChunkResume:
         assert state["calls"].count("chunk_0000.m4a") == 2
 
 
+class TestCudaFallback:
+    def test_cuda_library_error_retries_on_cpu(self, tmp_path, monkeypatch):
+        attempts = []
+        module = types.ModuleType("faster_whisper")
+
+        class FakeWhisperModel:
+            def __init__(self, modelSize, device, compute_type):
+                attempts.append((device, compute_type))
+                if device == "cuda":
+                    raise RuntimeError(
+                        "Library libcublas.so.12 is not found or cannot be loaded"
+                    )
+
+            def transcribe(self, audioPath, **kwargs):
+                return (
+                    iter([SimpleNamespace(start=0.0, end=1.0, text="你好")]),
+                    SimpleNamespace(language="zh", language_probability=0.99),
+                )
+
+        module.WhisperModel = FakeWhisperModel
+        monkeypatch.setitem(sys.modules, "faster_whisper", module)
+
+        results = asr.transcribe(
+            "audio.aac",
+            modelSize="small",
+            device="cuda",
+            computeType="float16",
+            diarize=False,
+            outputPath=str(tmp_path / "out"),
+            chunkSec=0,
+        )
+
+        assert attempts == [("cuda", "float16"), ("cpu", "int8")]
+        assert results[0]["text"] == "你好"
+
+    def test_non_cuda_error_is_not_retried(self, monkeypatch):
+        attempts = []
+        module = types.ModuleType("faster_whisper")
+
+        class FakeWhisperModel:
+            def __init__(self, modelSize, device, compute_type):
+                attempts.append(device)
+                raise RuntimeError("model file is corrupt")
+
+        module.WhisperModel = FakeWhisperModel
+        monkeypatch.setitem(sys.modules, "faster_whisper", module)
+
+        with pytest.raises(RuntimeError, match="corrupt"):
+            asr.transcribe("audio.aac", device="cuda", diarize=False, chunkSec=0)
+
+        assert attempts == ["cuda"]
+
+
 class TestSplitAudio:
     def test_missing_ffmpeg_raises(self, tmp_path, monkeypatch):
         def missing(*args, **kwargs):

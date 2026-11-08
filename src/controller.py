@@ -297,7 +297,7 @@ class Controller:
         # 1. Auth
         self._auth = Auth.fromEnv()
         if not self._auth.cookieStr:
-            log.error("No cookies in .env")
+            log.error("No usable cookies in env/.env or cookie.txt")
             return
 
         # 2. Room info
@@ -799,7 +799,20 @@ class Controller:
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 elapsedMs = int((time.monotonic() - startedAt) * 1000)
-                log.warning(f"ASR failed — marking as unavailable: {err}", exc_info=True)
+                hint = ""
+                if any(
+                    token in err
+                    for token in ("LocalEntryNotFoundError", "ConnectTimeout", "offline")
+                ):
+                    hint = (
+                        " (model not cached or HuggingFace unreachable; "
+                        "pre-download with scripts/download_models.py or set "
+                        "HF_ENDPOINT=https://hf-mirror.com)"
+                    )
+                log.warning(
+                    f"ASR failed — marking as unavailable: {err}{hint}",
+                    exc_info=True,
+                )
                 with open(asrPath, "w", encoding="utf-8") as f:
                     json.dump({"status": "failed", "segments": [], "error": err}, f)
                 # Record the failed attempt too: the validator will reject it
@@ -1379,10 +1392,14 @@ class Controller:
                 except OSError:
                     pass
                 try:
-                    await asyncio.to_thread(
+                    srtWritten = await asyncio.to_thread(
                         generateClipSrt, srtPath, clip["start"], clip["end"], clipSrtPath,
                     )
-                    generated.append(clipSrtPath)
+                    if srtWritten is False or not os.path.exists(clipSrtPath):
+                        srtFailures += 1
+                        log.debug(f"Clip SRT produced no file for {clipPath}")
+                    else:
+                        generated.append(clipSrtPath)
                 except Exception:
                     srtFailures += 1
                     log.debug(f"Clip SRT failed for {clipPath}", exc_info=True)

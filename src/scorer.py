@@ -209,6 +209,12 @@ def score(
     drops: list[dict] = []
     adjustments: list[dict] = []
     clips = _detectPeaks(finalScore, sensitivity)
+    if not clips:
+        log.info(
+            "No peaks above adaptive threshold "
+            f"(sensitivity={sensitivity:.2f}, maxScore={float(np.max(finalScore)):.3f}); "
+            "consider --two-stage or a lower --sensitivity"
+        )
 
     # ── Boundary optimization ──────────────────────────────────
     clips = _optimizeBoundaries(clips, nSecs, zMatrix)

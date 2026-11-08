@@ -361,6 +361,33 @@ def _transcribeChunked(
     return merged
 
 
+_CUDA_RUNTIME_TOKENS = ("cublas", "cudnn", "cuda", "libcuda")
+
+
+def _isCudaRuntimeError(exc: BaseException) -> bool:
+    """Return True for CUDA driver/library failures that CPU can handle."""
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(token in message for token in _CUDA_RUNTIME_TOKENS)
+
+
+def _transcribeWithRuntime(
+    audioPath: str,
+    runtime: dict,
+    outputPath: str | None,
+) -> list[dict]:
+    """Run one full transcription pass with a resolved runtime."""
+    duration = 0.0
+    if runtime["chunkSec"] > 0:
+        duration = float(probeMedia(audioPath).get("durationSec") or 0.0)
+    if duration > runtime["chunkSec"]:
+        return _transcribeChunked(audioPath, runtime, outputPath)
+
+    results, _, _ = _transcribeOnce(audioPath, runtime)
+    _writeOutput(results, outputPath)
+    _removeCheckpoint(outputPath)
+    return results
+
+
 def transcribe(
     audioPath: str,
     modelSize: str = "base",
@@ -413,16 +440,18 @@ def transcribe(
         "resume": bool(resume),
     }
 
-    duration = 0.0
-    if runtime["chunkSec"] > 0:
-        duration = float(probeMedia(audioPath).get("durationSec") or 0.0)
-    if duration > runtime["chunkSec"]:
-        return _transcribeChunked(audioPath, runtime, outputPath)
-
-    results, _, _ = _transcribeOnce(audioPath, runtime)
-    _writeOutput(results, outputPath)
-    _removeCheckpoint(outputPath)
-    return results
+    try:
+        return _transcribeWithRuntime(audioPath, runtime, outputPath)
+    except Exception as exc:
+        if runtime["device"] != "cuda" or not _isCudaRuntimeError(exc):
+            raise
+        log.warning(
+            f"CUDA ASR failed ({type(exc).__name__}: {exc}) — "
+            "retrying on CPU with int8"
+        )
+        runtime["device"] = "cpu"
+        runtime["computeType"] = "int8"
+        return _transcribeWithRuntime(audioPath, runtime, outputPath)
 
 
 def _parseArgs() -> argparse.Namespace:

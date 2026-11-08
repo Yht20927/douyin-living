@@ -105,7 +105,8 @@ jq -r 'select(.event == "pipeline.finish")
 
 ### 症状
 
-- 日志出现 `No cookies in .env`；
+- 日志出现 `No usable cookies in env/.env or cookie.txt`；
+- 日志出现 `Skipped N invalid cookie entries`；
 - `Fetching room info` 之后报 401/403、空响应或 `Room not live`；
 - 弹幕 WebSocket 连上后立即断开；
 - 房间信息接口成功但拉流地址为空。
@@ -124,17 +125,25 @@ jq -r 'select(.event == "pipeline.finish")
    DY_LIVE_COOKIES="新的 Cookie 字符串"
    ```
 
+   也可以保存为项目根目录 `cookie.txt`，或用
+   `DY_COOKIE_FILE=/path/to/cookies.txt` 指定。加载优先级：
+   `DY_LIVE_COOKIES` → `DY_COOKIES` → `DY_COOKIE_FILE` → `./cookie.txt`。
+   `cookie.txt` 支持单行原始字符串和 Netscape 导出格式。
+
    如果代码路径使用 `DY_COOKIES`，同步更新。不要把 Cookie 写进 `config/*.yaml` 或提交到 Git。
 
-3. 重新运行：
+3. 如果日志提示跳过非法条目（常见原因是复制时被截断成 `…`）：重新复制
+   完整 Cookie。非法条目会被自动丢弃，不会导致进程崩溃，也不会打印值。
+
+4. 重新运行：
 
    ```bash
    python -m src.controller "$ROOM" --clip-only
    ```
 
-4. 抖音 Cookie 通常约 24 小时失效。长时间录制时建议在开播前更新，并把 Cookie 过期视为日常运维项，而不是代码故障。
+5. 抖音 Cookie 通常约 24 小时失效。长时间录制时建议在开播前更新，并把 Cookie 过期视为日常运维项，而不是代码故障。
 
-5. 如果 Cookie 刚更新仍持续 403：确认房间 ID 正确、当前网络/IP 未被风控、请求频率没有异常；必要时更换网络后再试。
+6. 如果 Cookie 刚更新仍持续 403：确认房间 ID 正确、当前网络/IP 未被风控、请求频率没有异常；必要时更换网络后再试。
 
 ---
 
@@ -361,6 +370,8 @@ jq -r 'select(.event == "pipeline.finish")
 ### 症状
 
 - 日志：`MemoryError`、`CUDA out of memory`、`torch.OutOfMemoryError`、`Killed`；
+- 日志：`Library libcublas.so.12 is not found or cannot be loaded` 等 CUDA
+  运行库错误；
 - `pipeline_status.json` 中 `2_asr` 为 `failed`；
 - `*_asr.json` 内容为 `{"status": "failed", ...}`。
 
@@ -373,6 +384,10 @@ jq -r 'select(.event == "pipeline.finish")
    free -h
    dmesg | tail -30        # 查找 OOM killer / Killed process
    ```
+
+   CUDA 运行库缺失（如 `libcublas.so.12 is not found`）不是 OOM：
+   `asr.transcribe` 会自动改用 CPU/int8 重试并记录 warning。想避免首次失败
+   和额外模型加载，直接设置 `ASR_DEVICE=cpu`。
 
 2. 降低 ASR 资源占用。以下配置在 `config/asr.yaml`，也可用环境变量覆盖（无需改代码）。
    新变量使用 `ASR_*` 前缀；旧 `PIPELINE_ASR_*` 仍可作为别名使用：
@@ -681,9 +696,14 @@ jq '.steps["9_subtitles_thumbnails"].meta' data/300294032039/pipeline_status.jso
 
 - `assets.video` 必填；`assets.srt` / `assets.thumbnail` 在对应文件生成失败或
   不存在时为 `null`；
+- `srtFailures` 现在同时统计“源 ASR SRT 缺失”和“片段区间内无字幕条目”，
+  不再把这两种情况静默当作成功；
 - `suggestedAction` 只是规则提示（`drop`/`review`/`keep`），不能替代人工判断；
 - `--dry-run` 不进入 step 9，因此不会生成片段 JSON；
-- 元数据失败只累计 `metadataFailures` 并输出 warning，不影响已生成的 mp4。
+- 元数据失败只累计 `metadataFailures` 并输出 warning，不影响已生成的 mp4；
+- `highlights/` 可能保留上一轮或切换评分模式前生成的 `clip_*` 文件；
+  元数据只描述本次 `time_table.json` 中的片段，不会自动删除旧产物，
+  交付前按文件名/时间码人工清理。
 
 排障：
 

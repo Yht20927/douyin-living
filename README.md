@@ -64,6 +64,14 @@ DY_COOKIES="你的Cookie字符串"
 DY_LIVE_COOKIES="你的Cookie字符串"
 ```
 
+也可以把原始 Cookie 字符串保存为项目根目录的 `cookie.txt`（或通过
+`DY_COOKIE_FILE=/path/to/cookies.txt` 指定）。优先级：
+`DY_LIVE_COOKIES` → `DY_COOKIES` → `DY_COOKIE_FILE` → `./cookie.txt`。
+
+浏览器复制可能截断某个值（例如出现 `…`）。非 ASCII/格式非法的条目会被
+跳过并只记录条目名，不会打印 Cookie 值；建议重新复制完整 Cookie 以恢复
+登录态。`cookie.txt` 同时支持浏览器导出的 Netscape 格式。
+
 ### 4. 运行
 
 ```bash
@@ -281,6 +289,9 @@ resume: true
   `ASR_MODEL=large-v3`；
 - 当 `device=auto` 但 CUDA 不可用、或 CPU 上配置了 CUDA-only 的
   `float16/int8_float16/bfloat16` 时，会自动降级到 CPU/int8 并在日志中说明；
+- 如果 CUDA 运行库缺失或无法加载（如 `libcublas.so.12`），ASR 会自动改用
+  CPU/int8 重试并记录 warning；想避免首次失败和重复加载，可显式设置
+  `ASR_DEVICE=cpu`；
 - 超过 `chunk_sec`（默认 30 分钟）的音频会经 ffmpeg 重编码为 16 kHz 单声道分块；
   每完成一块就写 `<asr_json>.chunks.json`，进程中断后重跑会跳过已完成块；
   全部成功后删除检查点，失败则保留以便续跑。检查点签名包含音频大小/修改时间与
@@ -413,6 +424,8 @@ python -m src.controller 300294032039 --clip-only --dry-run \
 - `suggestedAction`：有 `dropReasons` → `drop`，有 `risks` → `review`，否则
   `keep`，只是人工审核提示；
 - `assets` 记录同 stem 的实际文件，缺失的 SRT/封面为 `null`；
+- 源 ASR SRT 缺失或片段区间无字幕时，`assets.srt` 为 `null`，并计入
+  `9_subtitles_thumbnails.meta.srtFailures`；
 - 元数据写入失败只记 warning（`pipeline_status.json` 的
   `9_subtitles_thumbnails.meta.metadataFailures`），不会中断裁剪。
 

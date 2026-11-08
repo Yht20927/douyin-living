@@ -39,7 +39,9 @@ class TestGenerateClipSrt:
         srt = _writeSrt(SAMPLE_SRT)
         out = srt + ".out"
         try:
-            generateClipSrt(srt, clipStart=5.0, clipEnd=9.0, outputPath=out)
+            assert generateClipSrt(
+                srt, clipStart=5.0, clipEnd=9.0, outputPath=out
+            ) is True
             assert os.path.exists(out)
             with open(out, encoding="utf-8") as fh:
                 body = fh.read()
@@ -71,7 +73,9 @@ class TestGenerateClipSrt:
         out = srt + ".out"
         try:
             # Range that contains no entries
-            generateClipSrt(srt, clipStart=100.0, clipEnd=200.0, outputPath=out)
+            assert generateClipSrt(
+                srt, clipStart=100.0, clipEnd=200.0, outputPath=out
+            ) is False
             # No file should have been created
             assert not os.path.exists(out)
         finally:
@@ -79,12 +83,12 @@ class TestGenerateClipSrt:
             if os.path.exists(out):
                 os.remove(out)
 
-    def test_missing_input_is_noop(self):
-        # Non-existent SRT → silent no-op (function returns None,
-        # never raises).  This protects callers that always invoke it.
+    def test_missing_input_returns_false(self):
+        # Non-existent SRT → no file and False (never raises), so callers can
+        # distinguish "no subtitles available" from a successful empty range.
         out = tempfile.mkstemp(suffix=".srt")[1]
         os.remove(out)  # delete the placeholder so we can detect re-creation
-        generateClipSrt("/nonexistent/path.srt", 0.0, 10.0, out)
+        assert generateClipSrt("/nonexistent/path.srt", 0.0, 10.0, out) is False
         assert not os.path.exists(out)
 
     def test_partial_overlap_truncated(self):

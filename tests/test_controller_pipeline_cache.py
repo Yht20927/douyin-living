@@ -705,3 +705,27 @@ class TestClipMetadataArtifacts:
         assert status["steps"]["9_subtitles_thumbnails"]["status"] == "ok"
         assert meta["metadata"] == 0
         assert meta["metadataFailures"] == 2
+
+    def test_missing_source_srt_counts_failure(self, pipelineEnv, monkeypatch):
+        def noSubtitles(*args, **kwargs):
+            return False
+
+        monkeypatch.setattr("src.clipper.generateClipSrt", noSubtitles)
+
+        runPipeline(pipelineEnv["outputDir"])
+
+        status = loadStatus(pipelineEnv["outputDir"])
+        meta = status["steps"]["9_subtitles_thumbnails"]["meta"]
+        assert meta["srtFailures"] == 2
+        assert meta["thumbnailFailures"] == 0
+        assert meta["metadata"] == 2
+        assert meta["metadataFailures"] == 0
+
+        documents = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in self._metadataFiles(pipelineEnv["outputDir"])
+        ]
+        assert all(document["assets"]["srt"] is None for document in documents)
+        assert all(
+            document["assets"]["thumbnail"] is not None for document in documents
+        )
