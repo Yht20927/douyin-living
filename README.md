@@ -515,3 +515,12 @@ Douyin_Spider 为本项目提供了以下关键参考：
 ## 📄 License
 
 MIT
+## Star History
+
+<a href="https://www.star-history.com/?repos=yht20927%2Fdouyin-living&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yht20927/douyin-living&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yht20927/douyin-living&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yht20927/douyin-living&type=date&legend=top-left" />
+ </picture>
+</a>
